@@ -44,7 +44,7 @@ CFLAGS = -pthread -I./ -D_GNU_SOURCE \
 	-Wmissing-declarations -Wold-style-definition -Wpointer-arith \
 	-Wcast-qual -Wundef -Wwrite-strings \
 	-Wformat -Wformat-security -fstack-protector -D_FORTIFY_SOURCE=2\
-	-Wunreachable-code -Wmissing-noreturn -Wsign-compare -Wno-endif-labels
+	-Wunreachable-code -Wsign-compare -Wno-endif-labels
 ifneq ($(EXTRA_CFLAGS),)
 CFLAGS += $(EXTRA_CFLAGS)
 endif
@@ -54,7 +54,9 @@ DOXY_DIRS = doc_api doc_lib
 # ICC and GCC options
 ifeq ($(CC),icc)
 else
-CFLAGS += -Wcast-align -Wnested-externs
+CFLAGS += -Wcast-align \
+    -Wnested-externs \
+    -Wmissing-noreturn
 endif
 
 # so or static build
@@ -82,14 +84,21 @@ CLEAN_OBJS = $(SRCS:.c=.o)
 
 # On FreeBSD build with no OS support
 ifeq ($(shell uname), FreeBSD)
-OBJS := $(filter-out perf.o os_allocation.o os_monitoring.o,$(OBJS))
+OBJS := $(filter-out perf.o \
+	os_allocation.o \
+	os_monitoring.o \
+	resctrl.o \
+	resctrl_alloc.o \
+	resctrl_monitoring.o \
+	perf_monitoring.o,$(OBJS))
 endif
 
 HDR = pqos.h
 PREFIX ?= /usr/local
-LIB_INSTALL_DIR = $(DESTDIR)/usr/lib
-HDR_DIR ?= $(DESTDIR)/usr/include
+LIB_INSTALL_DIR ?= $(PREFIX)/lib
+HDR_DIR ?= $(PREFIX)/include
 DEPFILE = $(LIB).dep
+NOLDCONFIG ?= n
 
 all: $(LIBNAME)
 
@@ -116,15 +125,21 @@ endif
 
 # Create symlinks to DSO
 ifeq ($(SHARED),y)
-#	ln -f -s $(LIB_INSTALL_DIR)/$(LIB).so.0 $(LIBDIR)/$(LIB).so
-#	ln -f -s $(LIB_INSTALL_DIR)/$(LIBNAME) $(LIBDIR)/$(LIB).so.0
-	ln -f -s /usr/lib/$(LIB).so.$(SO_VERSION) $(LIB_INSTALL_DIR)/$(LIB).so
-	ln -f -s /usr/lib/$(LIBNAME) $(LIB_INSTALL_DIR)/$(LIB).so.$(SO_VERSION)
-#	ldconfig
+	cd $(LIB_INSTALL_DIR); \
+		ln -f -s $(LIB).so.$(VERSION) $(LIB).so.$(SO_VERSION); \
+		ln -f -s $(LIB).so.$(SO_VERSION) $(LIB).so
+ifneq ($(NOLDCONFIG),y)
+	ldconfig
+endif
 endif
 
 uninstall:
 	-rm $(LIB_INSTALL_DIR)/libpqos*
+ifeq ($(SHARED),y)
+ifneq ($(NOLDCONFIG),y)
+	ldconfig
+endif
+endif
 
 DEPFILES = $(SRCS:.c=.d)
 
@@ -176,7 +191,10 @@ style:
 	$(CHECKPATCH) --no-tree --no-signoff --emacs \
 	--ignore CODE_INDENT,INITIALISED_STATIC,LEADING_SPACE,SPLIT_STRING,\
 	NEW_TYPEDEFS,UNSPECIFIED_INT,BLOCK_COMMENT_STYLE \
-	-f pqos.h -f cpuinfo.c
+	-f pqos.h -f cpuinfo.c \
+	-f perf_monitoring.h -f perf_monitoring.c \
+	-f resctrl.h -f resctrl.c \
+	-f resctrl_monitoring.h -f resctrl_monitoring.c
 
 CPPCHECK?=cppcheck
 .PHONY: cppcheck
@@ -190,7 +208,10 @@ cppcheck:
 	utils.c utils.h \
 	cpuinfo.c cpuinfo.h os_allocation.h os_allocation.c \
 	os_monitoring.h os_monitoring.c \
-	resctrl_alloc.h resctrl_alloc.c
+	perf_monitoring.h perf_monitoring.c \
+	resctrl_alloc.h resctrl_alloc.c \
+	resctrl.h resctrl.c \
+	resctrl_monitoring.h resctrl_monitoring.c
 
 # if target not clean or rinse then make dependencies
 ifneq ($(MAKECMDGOALS),clean)

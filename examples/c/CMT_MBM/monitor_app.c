@@ -1,7 +1,7 @@
 /*
  * BSD LICENSE
  *
- * Copyright(c) 2014-2016 Intel Corporation. All rights reserved.
+ * Copyright(c) 2014-2018 Intel Corporation. All rights reserved.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -62,7 +62,7 @@ static int sel_monitor_num = 0;
 /**
  * The mask to tell which events to display
  */
-static enum pqos_mon_event sel_events_max = 0;
+static enum pqos_mon_event sel_events_max = (enum pqos_mon_event)0;
 
 /**
  * Maintains a table of core, event, number of events that are
@@ -93,7 +93,7 @@ static int sel_process_num = 0;
 /**
  * Flag to determine which library interface to use
  */
-static int interface = PQOS_INTER_MSR;
+static enum pqos_interface interface = PQOS_INTER_MSR;
 
 static void stop_monitoring(void);
 
@@ -102,7 +102,7 @@ static void stop_monitoring(void);
  *
  * @param [in] signo signal number
  */
-static void monitoring_ctrlc(int signo)
+static void __attribute__((noreturn)) monitoring_ctrlc(int signo)
 {
 	printf("\nExiting[%d]...\n", signo);
         stop_monitoring();
@@ -232,8 +232,8 @@ setup_monitoring(const struct pqos_cpuinfo *cpu_info,
                  const struct pqos_capability * const cap_mon)
 {
 	unsigned i;
-        const enum pqos_mon_event perf_events =
-                PQOS_PERF_EVENT_IPC | PQOS_PERF_EVENT_LLC_MISS;
+        const enum pqos_mon_event perf_events = (enum pqos_mon_event)
+            (PQOS_PERF_EVENT_IPC | PQOS_PERF_EVENT_LLC_MISS);
 
         for (i = 0; (unsigned)i < cap_mon->u.mon->num_events; i++)
                 sel_events_max |= (cap_mon->u.mon->events[i].type);
@@ -274,7 +274,8 @@ setup_monitoring(const struct pqos_cpuinfo *cpu_info,
                         pid_t pid = sel_monitor_pid_tab[i].pid;
                         int ret;
 
-                        ret = pqos_mon_start_pid(pid, PQOS_MON_EVENT_L3_OCCUP,
+                        ret = pqos_mon_start_pids(1, &pid,
+                                                 PQOS_MON_EVENT_L3_OCCUP,
                                                  NULL,
                                                  sel_monitor_pid_tab[i].pgrp);
                         if (ret != PQOS_RETVAL_OK) {
@@ -361,7 +362,7 @@ static void monitoring_loop(void)
                                 double llc = bytes_to_kb(pv->llc);
 
                                 printf("%6d %10.1f\n",
-                                       m_mon_grps[i]->pid, llc);
+                                       m_mon_grps[i]->pids[0], llc);
                         }
                 }
 		printf("\nPress Enter to continue or Ctrl+c to exit");

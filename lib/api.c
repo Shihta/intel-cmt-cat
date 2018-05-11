@@ -1,7 +1,7 @@
 /*
  * BSD LICENSE
  *
- * Copyright(c) 2017 Intel Corporation. All rights reserved.
+ * Copyright(c) 2017-2018 Intel Corporation. All rights reserved.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -67,7 +67,8 @@ static int m_interface = PQOS_INTER_MSR;
 int
 api_init(int interface)
 {
-        if (interface != PQOS_INTER_MSR && interface != PQOS_INTER_OS)
+        if (interface != PQOS_INTER_MSR && interface != PQOS_INTER_OS &&
+                interface != PQOS_INTER_OS_RESCTRL_MON)
                 return PQOS_RETVAL_PARAM;
 
         m_interface = interface;
@@ -155,7 +156,8 @@ pqos_alloc_assoc_set_pid(const pid_t task,
                 return ret;
         }
 
-        if (m_interface != PQOS_INTER_OS) {
+        if (m_interface != PQOS_INTER_OS &&
+                m_interface != PQOS_INTER_OS_RESCTRL_MON) {
                 LOG_ERROR("Incompatible interface "
                           "selected for task association!\n");
                 _pqos_api_unlock();
@@ -193,7 +195,8 @@ pqos_alloc_assoc_get_pid(const pid_t task,
                 return ret;
         }
 
-        if (m_interface != PQOS_INTER_OS) {
+        if (m_interface != PQOS_INTER_OS &&
+                m_interface != PQOS_INTER_OS_RESCTRL_MON) {
                 LOG_ERROR("Incompatible interface "
                           "selected for task association!\n");
                 _pqos_api_unlock();
@@ -303,7 +306,8 @@ pqos_alloc_assign_pid(const unsigned technology,
                 return ret;
         }
 
-        if (m_interface != PQOS_INTER_OS) {
+        if (m_interface != PQOS_INTER_OS &&
+                m_interface != PQOS_INTER_OS_RESCTRL_MON) {
                 LOG_ERROR("Incompatible interface "
                           "selected for task association!\n");
                 _pqos_api_unlock();
@@ -339,7 +343,8 @@ pqos_alloc_release_pid(const pid_t *task_array,
                 return ret;
         }
 
-        if (m_interface != PQOS_INTER_OS) {
+        if (m_interface != PQOS_INTER_OS &&
+                m_interface != PQOS_INTER_OS_RESCTRL_MON) {
                 LOG_ERROR("Incompatible interface "
                           "selected for task association!\n");
                 _pqos_api_unlock();
@@ -358,7 +363,8 @@ pqos_alloc_release_pid(const pid_t *task_array,
 }
 
 int
-pqos_alloc_reset(const enum pqos_cdp_config l3_cdp_cfg)
+pqos_alloc_reset(const enum pqos_cdp_config l3_cdp_cfg,
+                 const enum pqos_cdp_config l2_cdp_cfg)
 {
 	int ret;
 
@@ -370,6 +376,14 @@ pqos_alloc_reset(const enum pqos_cdp_config l3_cdp_cfg)
                 return PQOS_RETVAL_PARAM;
         }
 
+        if (l2_cdp_cfg != PQOS_REQUIRE_CDP_ON &&
+            l2_cdp_cfg != PQOS_REQUIRE_CDP_OFF &&
+            l2_cdp_cfg != PQOS_REQUIRE_CDP_ANY) {
+                LOG_ERROR("Unrecognized L2 CDP configuration setting %d!\n",
+                          l2_cdp_cfg);
+                return PQOS_RETVAL_PARAM;
+        }
+
         _pqos_api_lock();
 
         ret = _pqos_check_init(1);
@@ -378,11 +392,11 @@ pqos_alloc_reset(const enum pqos_cdp_config l3_cdp_cfg)
                 return ret;
         }
 
-	if (m_interface == PQOS_INTER_MSR)
-                ret = hw_alloc_reset(l3_cdp_cfg);
+        if (m_interface == PQOS_INTER_MSR)
+                ret = hw_alloc_reset(l3_cdp_cfg, l2_cdp_cfg);
         else {
 #ifdef __linux__
-                ret = os_alloc_reset(l3_cdp_cfg);
+                ret = os_alloc_reset(l3_cdp_cfg, l2_cdp_cfg);
 #else
                 LOG_INFO("OS interface not supported!\n");
                 ret = PQOS_RETVAL_RESOURCE;
@@ -402,7 +416,8 @@ pqos_pid_get_pid_assoc(const unsigned class_id, unsigned *count)
         if (count == NULL)
                 return NULL;
 
-        if (m_interface != PQOS_INTER_OS) {
+        if (m_interface != PQOS_INTER_OS &&
+                m_interface != PQOS_INTER_OS_RESCTRL_MON) {
                 LOG_ERROR("Incompatible interface "
                           "selected for task association!\n");
                 return NULL;
@@ -612,7 +627,15 @@ pqos_l2ca_set(const unsigned l2id,
 	 * Check if class bitmasks are contiguous
 	 */
 	for (i = 0; i < num_cos; i++) {
-		if (!is_contiguous(ca[i].ways_mask)) {
+                int is_contig = 0;
+
+                if (ca[i].cdp) {
+                        is_contig = is_contiguous(ca[i].u.s.data_mask) &&
+                                is_contiguous(ca[i].u.s.code_mask);
+                } else
+                        is_contig = is_contiguous(ca[i].u.ways_mask);
+
+                if (!is_contig) {
 			LOG_ERROR("L2 COS%u bit mask is not contiguous!\n",
 			          ca[i].class_id);
 			_pqos_api_unlock();
@@ -810,8 +833,12 @@ pqos_mon_reset(void)
         if (m_interface == PQOS_INTER_MSR)
                 ret = hw_mon_reset();
         else {
+#ifdef __linux__
+                ret = os_mon_reset();
+#else
                 LOG_INFO("OS interface not supported!\n");
                 ret = PQOS_RETVAL_RESOURCE;
+#endif
         }
 
         _pqos_api_unlock();
@@ -887,13 +914,6 @@ pqos_mon_start(const unsigned num_cores,
                 ret = hw_mon_start(num_cores, cores, event, context, group);
         else {
 #ifdef __linux__
-                static int warn = 1;
-                /* Only log warning for first call */
-                if (warn) {
-                        LOG_WARN("As of Kernel 4.10, Intel(R) RDT perf results"
-                                 " per core are found to be incorrect.\n");
-                        warn = 0;
-                }
                 ret = os_mon_start(num_cores, cores, event, context, group);
 #else
                 LOG_INFO("OS interface not supported!\n");
@@ -988,19 +1008,31 @@ pqos_mon_start_pid(const pid_t pid,
                    void *context,
                    struct pqos_mon_data *group)
 {
+        return pqos_mon_start_pids(1, &pid, event, context, group);
+}
+
+int
+pqos_mon_start_pids(const unsigned num_pids,
+                    const pid_t *pids,
+                    const enum pqos_mon_event event,
+                    void *context,
+                    struct pqos_mon_data *group)
+{
         int ret;
 
-        if (group == NULL || event == 0 || pid < 0)
+        if (num_pids == 0 || pids == NULL || group == NULL || event == 0)
                 return PQOS_RETVAL_PARAM;
 
         if (group->valid == GROUP_VALID_MARKER)
                 return PQOS_RETVAL_PARAM;
 
-        if (m_interface != PQOS_INTER_OS) {
+        if (m_interface != PQOS_INTER_OS &&
+                m_interface != PQOS_INTER_OS_RESCTRL_MON) {
                 LOG_ERROR("Incompatible interface "
                           "selected for task monitoring!\n");
                 return PQOS_RETVAL_ERROR;
         }
+
         /**
          * Validate event parameter
          * - only combinations of events allowed
@@ -1024,22 +1056,96 @@ pqos_mon_start_pid(const pid_t pid,
                 return ret;
         }
 
-        memset(group, 0, sizeof(*group));
-        group->event = event;
-        group->pid = pid;
-        group->context = context;
-
 #ifdef __linux__
-        ret = os_mon_start_pid(group);
+        ret = os_mon_start_pids(num_pids, pids, event, context, group);
 #else
+        UNUSED_PARAM(context);
         LOG_INFO("OS interface not supported!\n");
         ret = PQOS_RETVAL_RESOURCE;
 #endif
+
         if (ret == PQOS_RETVAL_OK)
                 group->valid = GROUP_VALID_MARKER;
 
         _pqos_api_unlock();
 
         return ret;
+}
 
+int pqos_mon_add_pids(const unsigned num_pids,
+                      const pid_t *pids,
+                      struct pqos_mon_data *group)
+{
+        int ret;
+
+        if (num_pids == 0 || pids == NULL || group == NULL)
+                return PQOS_RETVAL_PARAM;
+
+        if (group->valid != GROUP_VALID_MARKER)
+                return PQOS_RETVAL_PARAM;
+
+        if (m_interface != PQOS_INTER_OS &&
+                m_interface != PQOS_INTER_OS_RESCTRL_MON) {
+                LOG_ERROR("Incompatible interface "
+                          "selected for task monitoring!\n");
+                return PQOS_RETVAL_ERROR;
+        }
+
+        _pqos_api_lock();
+
+        ret = _pqos_check_init(1);
+        if (ret != PQOS_RETVAL_OK) {
+                _pqos_api_unlock();
+                return ret;
+        }
+
+#ifdef __linux__
+        ret = os_mon_add_pids(num_pids, pids, group);
+#else
+        LOG_INFO("OS interface not supported!\n");
+        ret = PQOS_RETVAL_RESOURCE;
+#endif
+
+        _pqos_api_unlock();
+
+        return ret;
+}
+
+int pqos_mon_remove_pids(const unsigned num_pids,
+                         const pid_t *pids,
+                         struct pqos_mon_data *group)
+{
+        int ret;
+
+        if (num_pids == 0 || pids == NULL || group == NULL)
+                return PQOS_RETVAL_PARAM;
+
+        if (group->valid != GROUP_VALID_MARKER)
+                return PQOS_RETVAL_PARAM;
+
+        if (m_interface != PQOS_INTER_OS &&
+                m_interface != PQOS_INTER_OS_RESCTRL_MON) {
+                LOG_ERROR("Incompatible interface "
+                          "selected for task monitoring!\n");
+                return PQOS_RETVAL_ERROR;
+        }
+
+        _pqos_api_lock();
+
+        ret = _pqos_check_init(1);
+        if (ret != PQOS_RETVAL_OK) {
+                _pqos_api_unlock();
+                return ret;
+        }
+
+#ifdef __linux__
+        ret = os_mon_remove_pids(num_pids, pids, group);
+#else
+        LOG_INFO("OS interface not supported!\n");
+        ret = PQOS_RETVAL_RESOURCE;
+#endif
+
+        _pqos_api_unlock();
+
+        return ret;
 }

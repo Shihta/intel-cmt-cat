@@ -43,7 +43,7 @@ CFLAGS = -I$(LIBDIR) \
 	-Wmissing-declarations -Wold-style-definition -Wpointer-arith \
 	-Wcast-qual -Wundef -Wwrite-strings \
 	-Wformat -Wformat-security -fstack-protector -fPIE -D_FORTIFY_SOURCE=2 \
-	-Wunreachable-code -Wmissing-noreturn -Wsign-compare -Wno-endif-labels
+	-Wunreachable-code -Wsign-compare -Wno-endif-labels
 ifneq ($(EXTRA_CFLAGS),)
 CFLAGS += $(EXTRA_CFLAGS)
 endif
@@ -51,7 +51,9 @@ endif
 # ICC and GCC options
 ifeq ($(CC),icc)
 else
-CFLAGS += -Wcast-align -Wnested-externs
+CFLAGS += -Wcast-align \
+    -Wnested-externs \
+    -Wmissing-noreturn
 endif
 
 # DEBUG build
@@ -67,8 +69,8 @@ MAN = pqos.8
 
 # XXX: modify as desired
 PREFIX ?= /usr/local
-BIN_DIR = $(DESTDIR)/usr/sbin
-MAN_DIR = $(DESTDIR)/usr/share/man/man8
+BIN_DIR = $(PREFIX)/bin
+MAN_DIR = $(PREFIX)/man/man8
 
 SRCS = $(sort $(wildcard *.c))
 OBJS = $(SRCS:.c=.o)
@@ -100,8 +102,8 @@ else
 	install -D $(APP)-msr $(BIN_DIR)/$(APP)-msr
 	install -D $(APP)-os $(BIN_DIR)/$(APP)-os
 	install -m 0444 $(MAN) -D $(MAN_DIR)/$(MAN)
-	ln -f -s /usr/share/man/man8/$(MAN).gz $(MAN_DIR)/$(APP)-msr.8.gz
-	ln -f -s /usr/share/man/man8/$(MAN).gz $(MAN_DIR)/$(APP)-os.8.gz
+	ln -f -s $(MAN) $(MAN_DIR)/$(APP)-msr.8
+	ln -f -s $(MAN) $(MAN_DIR)/$(APP)-os.8
 endif
 
 uninstall:

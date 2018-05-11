@@ -1,7 +1,7 @@
 /*
  * BSD LICENSE
  *
- * Copyright(c) 2017 Intel Corporation. All rights reserved.
+ * Copyright(c) 2017-2018 Intel Corporation. All rights reserved.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -38,15 +38,17 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <stdlib.h>
-#include <sys/mount.h>
 #include <errno.h>
+#include <dirent.h>             /**< scandir() */
 
 #include "pqos.h"
 #include "os_allocation.h"
 #include "cap.h"
 #include "log.h"
 #include "types.h"
+#include "resctrl.h"
 #include "resctrl_alloc.h"
+#include "resctrl_monitoring.h"
 
 /**
  * ---------------------------------------
@@ -59,25 +61,30 @@ static const struct pqos_cpuinfo *m_cpu = NULL;
 /**
  * @brief Function to mount the resctrl file system with CDP option
  *
- * @param l3_cdp_cfg CDP option
+ * @param l3_cdp_cfg L3 CDP option
+ * @param l2_cdp_cfg L2 CDP option
  * @return Operational status
  * @retval PQOS_RETVAL_OK on success
  */
 static int
-os_interface_mount(const enum pqos_cdp_config l3_cdp_cfg)
+os_interface_mount(const enum pqos_cdp_config l3_cdp_cfg,
+                   const enum pqos_cdp_config l2_cdp_cfg)
 {
         const struct pqos_cap_l3ca *l3_cap = NULL;
+        const struct pqos_cap_l2ca *l2_cap = NULL;
         const struct pqos_capability *alloc_cap = NULL;
-        const char *cdp_option = NULL; /**< cdp_off default */
 
-        if (l3_cdp_cfg != PQOS_REQUIRE_CDP_ON &&
-            l3_cdp_cfg != PQOS_REQUIRE_CDP_OFF) {
+        if ((l3_cdp_cfg != PQOS_REQUIRE_CDP_ON &&
+            l3_cdp_cfg != PQOS_REQUIRE_CDP_OFF) || (
+            l2_cdp_cfg != PQOS_REQUIRE_CDP_ON &&
+            l2_cdp_cfg != PQOS_REQUIRE_CDP_OFF)) {
                 LOG_ERROR("Invalid CDP mounting setting %d!\n",
                           l3_cdp_cfg);
                 return PQOS_RETVAL_PARAM;
         }
 
-        if (l3_cdp_cfg == PQOS_REQUIRE_CDP_OFF)
+        if (l3_cdp_cfg == PQOS_REQUIRE_CDP_OFF &&
+                l2_cdp_cfg == PQOS_REQUIRE_CDP_OFF)
                 goto mount;
 
         /* Get L3 CAT capabilities */
@@ -85,18 +92,28 @@ os_interface_mount(const enum pqos_cdp_config l3_cdp_cfg)
         if (alloc_cap != NULL)
                 l3_cap = alloc_cap->u.l3ca;
 
-        if (l3_cap != NULL && !l3_cap->cdp) {
+        /* Get L2 CAT capabilities */
+        (void) pqos_cap_get_type(m_cap, PQOS_CAP_TYPE_L2CA, &alloc_cap);
+        if (alloc_cap != NULL)
+                l2_cap = alloc_cap->u.l2ca;
+
+        if (l3_cap != NULL && !l3_cap->os_cdp &&
+                l3_cdp_cfg == PQOS_REQUIRE_CDP_ON) {
                 /* Check against erroneous CDP request */
-                LOG_ERROR("CDP requested but not supported by the platform!\n");
+                LOG_ERROR("L3 CDP requested but not supported by the "
+                          "platform!\n");
                 return PQOS_RETVAL_PARAM;
         }
-        cdp_option = "cdp";  /**< cdp_on */
+        if (l2_cap != NULL && !l2_cap->os_cdp &&
+                l2_cdp_cfg == PQOS_REQUIRE_CDP_ON) {
+                /* Check against erroneous CDP request */
+                LOG_ERROR("L2 CDP requested but not supported by the "
+                          "platform!\n");
+                return PQOS_RETVAL_PARAM;
+        }
 
  mount:
-        if (mount("resctrl", RESCTRL_ALLOC_PATH, "resctrl", 0, cdp_option) != 0)
-                return PQOS_RETVAL_ERROR;
-
-        return PQOS_RETVAL_OK;
+        return resctrl_mount(l3_cdp_cfg, l2_cdp_cfg);
 }
 
 /**
@@ -130,15 +147,22 @@ os_alloc_check(void)
         /**
          * Check if resctrl is mounted
          */
-        if (access(RESCTRL_ALLOC_PATH"/cpus", F_OK) != 0) {
+        if (access(RESCTRL_PATH"/cpus", F_OK) != 0) {
                 const struct pqos_capability *alloc_cap = NULL;
-                int cdp_mount = PQOS_REQUIRE_CDP_OFF;
+                enum pqos_cdp_config l3_cdp_mount = PQOS_REQUIRE_CDP_OFF;
+                enum pqos_cdp_config l2_cdp_mount = PQOS_REQUIRE_CDP_OFF;
+
                 /* Get L3 CAT capabilities */
                 (void) pqos_cap_get_type(m_cap, PQOS_CAP_TYPE_L3CA, &alloc_cap);
-                if (alloc_cap != NULL)
-                        cdp_mount = alloc_cap->u.l3ca->cdp_on;
+                if (alloc_cap != NULL && alloc_cap->u.l3ca->cdp_on)
+                        l3_cdp_mount = PQOS_REQUIRE_CDP_ON;
 
-                ret = os_interface_mount(cdp_mount);
+                /* Get L2 CAT capabilities */
+                (void) pqos_cap_get_type(m_cap, PQOS_CAP_TYPE_L2CA, &alloc_cap);
+                if (alloc_cap != NULL && alloc_cap->u.l2ca->cdp_on)
+                        l2_cdp_mount = PQOS_REQUIRE_CDP_ON;
+
+                ret = os_interface_mount(l3_cdp_mount, l2_cdp_mount);
                 if (ret != PQOS_RETVAL_OK) {
                         LOG_INFO("Unable to mount resctrl\n");
                         return PQOS_RETVAL_RESOURCE;
@@ -174,7 +198,7 @@ os_alloc_prep(void)
 
 		memset(buf, 0, sizeof(buf));
 		if (snprintf(buf, sizeof(buf) - 1,
-                             "%s/COS%d", RESCTRL_ALLOC_PATH, (int) i) < 0)
+                             "%s/COS%d", RESCTRL_PATH, (int) i) < 0)
 			return PQOS_RETVAL_ERROR;
 
 		/* if resctrl group doesn't exist - create it */
@@ -208,6 +232,10 @@ os_alloc_init(const struct pqos_cpuinfo *cpu, const struct pqos_cap *cap)
         if (ret != PQOS_RETVAL_OK)
                 return ret;
 
+        ret = resctrl_alloc_init(cpu, cap);
+        if (ret != PQOS_RETVAL_OK)
+                return ret;
+
         ret = os_alloc_prep();
 
         return ret;
@@ -224,72 +252,80 @@ os_alloc_fini(void)
 }
 
 int
-os_alloc_assoc_set(const unsigned lcore,
-                   const unsigned class_id)
+os_alloc_assoc_set(const unsigned lcore, const unsigned class_id)
 {
 	int ret;
-	unsigned num_l2_cos = 0, num_l3_cos = 0;
-	struct resctrl_alloc_cpumask mask;
+	unsigned grps;
+        int ret_mon;
+        char mon_group[256];
 
-	ASSERT(m_cpu != NULL);
-	ret = pqos_cpu_check_core(m_cpu, lcore);
-	if (ret != PQOS_RETVAL_OK)
-		return PQOS_RETVAL_PARAM;
+        ASSERT(m_cpu != NULL);
+        ASSERT(m_cap != NULL);
 
-	ASSERT(m_cap != NULL);
-	ret = pqos_l3ca_get_cos_num(m_cap, &num_l3_cos);
-	if (ret != PQOS_RETVAL_OK && ret != PQOS_RETVAL_RESOURCE)
-		return ret;
+        ret = pqos_cpu_check_core(m_cpu, lcore);
+        if (ret != PQOS_RETVAL_OK)
+                return PQOS_RETVAL_PARAM;
 
-	ret = pqos_l2ca_get_cos_num(m_cap, &num_l2_cos);
-	if (ret != PQOS_RETVAL_OK && ret != PQOS_RETVAL_RESOURCE)
-		return ret;
+        ret = resctrl_alloc_get_grps_num(m_cap, &grps);
+        if (ret != PQOS_RETVAL_OK)
+                return ret;
 
-	if (class_id >= num_l3_cos && class_id >= num_l2_cos)
+	if (class_id >= grps)
 		/* class_id is out of bounds */
 		return PQOS_RETVAL_PARAM;
 
-	ret = resctrl_alloc_cpumask_read(class_id, &mask);
-	if (ret != PQOS_RETVAL_OK)
-		return ret;
+        ret = resctrl_lock_exclusive();
+        if (ret != PQOS_RETVAL_OK)
+                return ret;
 
-	resctrl_alloc_cpumask_set(lcore, &mask);
+        /*
+         * When core is moved to different COS we need to update monitoring
+         * groups. Obtain monitoring group name
+         */
+        ret_mon = resctrl_mon_assoc_get(lcore, mon_group, sizeof(mon_group));
+        if (ret_mon != PQOS_RETVAL_OK && ret_mon != PQOS_RETVAL_RESOURCE)
+                LOG_WARN("Failed to obtain monitoring group assigment for "
+                         "core %u\n", lcore);
 
-	ret = resctrl_alloc_cpumask_write(class_id, &mask);
+        ret = resctrl_alloc_assoc_set(lcore, class_id);
+        if (ret != PQOS_RETVAL_OK)
+                goto os_alloc_assoc_set_exit;
+
+        /* Core monitoring was started assign it back to monitoring group */
+        if (ret_mon == PQOS_RETVAL_OK) {
+                ret_mon = resctrl_mon_assoc_set(lcore, mon_group);
+                if (ret_mon != PQOS_RETVAL_OK)
+                        LOG_WARN("Could not assign core %d back to monitoring "
+                                 "group\n", lcore);
+        }
+
+ os_alloc_assoc_set_exit:
+        resctrl_lock_release();
 
 	return ret;
 }
 
 int
-os_alloc_assoc_get(const unsigned lcore,
-                   unsigned *class_id)
+os_alloc_assoc_get(const unsigned lcore, unsigned *class_id)
 {
-	int ret;
-	unsigned grps, i;
-	struct resctrl_alloc_cpumask mask;
+        int ret;
 
-	ASSERT(class_id != NULL);
-	ASSERT(m_cpu != NULL);
-	ret = pqos_cpu_check_core(m_cpu, lcore);
+        ASSERT(class_id != NULL);
+        ASSERT(m_cpu != NULL);
+
+        ret = pqos_cpu_check_core(m_cpu, lcore);
 	if (ret != PQOS_RETVAL_OK)
 		return PQOS_RETVAL_PARAM;
 
-	ret = resctrl_alloc_get_grps_num(m_cap, &grps);
-	if (ret != PQOS_RETVAL_OK)
-		return ret;
+        ret = resctrl_lock_shared();
+        if (ret != PQOS_RETVAL_OK)
+                return ret;
 
-	for (i = 0; i < grps; i++) {
-		ret = resctrl_alloc_cpumask_read(i, &mask);
-		if (ret != PQOS_RETVAL_OK)
-			return ret;
+        ret = resctrl_alloc_assoc_get(lcore, class_id);
 
-		if (resctrl_alloc_cpumask_get(lcore, &mask)) {
-			*class_id = i;
-			return PQOS_RETVAL_OK;
-		}
-	}
+        resctrl_lock_release();
 
-	return PQOS_RETVAL_ERROR;
+	return ret;
 }
 
 unsigned *
@@ -297,6 +333,7 @@ os_pid_get_pid_assoc(const unsigned class_id, unsigned *count)
 {
         unsigned grps;
         int ret;
+        unsigned *tasks;
 
 	ASSERT(m_cap != NULL);
         ASSERT(count != NULL);
@@ -308,7 +345,15 @@ os_pid_get_pid_assoc(const unsigned class_id, unsigned *count)
 		/* class_id is out of bounds */
 		return NULL;
 
-	return resctrl_alloc_task_read(class_id, count);
+        ret = resctrl_lock_shared();
+        if (ret != PQOS_RETVAL_OK)
+                return NULL;
+
+	tasks = resctrl_alloc_task_read(class_id, count);
+
+        resctrl_lock_release();
+
+        return tasks;
 }
 
 /**
@@ -335,7 +380,7 @@ get_unused_cos(const unsigned hi_class_id,
         memset(used_classes, 0, sizeof(used_classes));
 
         for (i = hi_class_id; i != 0; i--) {
-                struct resctrl_alloc_cpumask mask;
+                struct resctrl_cpumask mask;
                 unsigned j;
 
                 ret = resctrl_alloc_cpumask_read(i, &mask);
@@ -410,49 +455,443 @@ os_alloc_release(const unsigned *core_array, const unsigned core_num)
 {
         int ret;
         unsigned i, cos0 = 0;
-        struct resctrl_alloc_cpumask mask;
+        struct resctrl_cpumask mask;
 
 	ASSERT(m_cpu != NULL);
         ASSERT(core_num > 0 && core_array != NULL);
+
+        ret = resctrl_lock_exclusive();
+        if (ret != PQOS_RETVAL_OK)
+                return ret;
+
         /**
          * Set the CPU assoc back to COS0
          */
         ret = resctrl_alloc_cpumask_read(cos0, &mask);
         if (ret != PQOS_RETVAL_OK)
-                return ret;
+                goto os_alloc_release_unlock;
         for (i = 0; i < core_num; i++) {
-		if (core_array[i] >= m_cpu->num_cores)
-			return PQOS_RETVAL_ERROR;
-                resctrl_alloc_cpumask_set(core_array[i], &mask);
+		if (core_array[i] >= m_cpu->num_cores) {
+			ret = PQOS_RETVAL_ERROR;
+                        goto os_alloc_release_unlock;
+                }
+                resctrl_cpumask_set(core_array[i], &mask);
 	}
 
         ret = resctrl_alloc_cpumask_write(cos0, &mask);
         if (ret != PQOS_RETVAL_OK)
                 LOG_ERROR("CPU assoc reset failed\n");
 
+ os_alloc_release_unlock:
+        resctrl_lock_release();
+
+        return ret;
+}
+
+/**
+ * @brief Moves all cores to COS0 (default)
+ *
+ * @return Operation status
+ */
+static int
+os_alloc_reset_cores(void)
+{
+	const unsigned default_cos = 0;
+	struct resctrl_cpumask mask;
+	unsigned i;
+	int ret;
+
+	LOG_INFO("OS alloc reset - core assoc\n");
+
+	ret = resctrl_alloc_cpumask_read(default_cos, &mask);
+	if (ret != PQOS_RETVAL_OK)
+		return ret;
+
+	for (i = 0; i < m_cpu->num_cores; i++)
+		resctrl_cpumask_set(m_cpu->cores[i].lcore, &mask);
+
+	ret = resctrl_alloc_cpumask_write(default_cos, &mask);
+	if (ret != PQOS_RETVAL_OK)
+		LOG_ERROR("Core assoc reset failed\n");
+
+	return ret;
+}
+
+/**
+ * @brief Resets L3, L2 and MBA schematas to default value
+ *
+ * @param [in] l3_cap l3 cache capability
+ * @param [in] l2_cap l2 cache capability
+ *
+ * @return Operation status
+ */
+static int
+os_alloc_reset_schematas(const struct pqos_cap_l3ca *l3_cap,
+		     const struct pqos_cap_l2ca *l2_cap){
+
+	const unsigned default_mba = 100;
+	uint64_t default_l3ca = 0;
+	uint64_t default_l2ca = 0;
+	unsigned grps;
+	unsigned i, j;
+	int ret;
+
+	LOG_INFO("OS alloc reset - schematas\n");
+
+	ret = resctrl_lock_exclusive();
+	if (ret != PQOS_RETVAL_OK)
+		return ret;
+
+	ret = resctrl_alloc_get_grps_num(m_cap, &grps);
+	if (ret != PQOS_RETVAL_OK)
+		goto os_alloc_reset_light_schematas_exit;
+
+	/**
+	 * Obtain default L2/L3 CAT mask
+	 */
+	if (l3_cap != NULL)
+		default_l3ca = ((uint64_t)1 << l3_cap->num_ways) - 1;
+
+	if (l2_cap != NULL)
+		default_l2ca = ((uint64_t)1 << l2_cap->num_ways) - 1;
+
+	/**
+	 * Reset schematas
+	 */
+	for (i = 0; i < grps; i++) {
+		struct resctrl_alloc_schemata schmt;
+
+		ret = resctrl_alloc_schemata_init(i, m_cap, m_cpu, &schmt);
+		if (ret != PQOS_RETVAL_OK) {
+			LOG_ERROR("Error on schemata init "
+				  "for resctrl group %u\n", i);
+			goto os_alloc_reset_light_schematas_exit;
+		}
+
+		for (j = 0; j < schmt.l3ca_num; j++) {
+			 /* l3ca_num should be greater
+			  * than 0 if l3_cap is provided */
+			ASSERT(l3_cap != NULL);
+			if (schmt.l3ca[j].cdp) {
+				schmt.l3ca[j].u.s.code_mask = default_l3ca;
+				schmt.l3ca[j].u.s.data_mask = default_l3ca;
+			} else
+				schmt.l3ca[j].u.ways_mask = default_l3ca;
+		}
+
+		for (j = 0; j < schmt.l2ca_num; j++) {
+			/* l2ca_num should be greater
+			 * than 0 if l2_cap is provided */
+			ASSERT(l2_cap != NULL);
+			if (schmt.l2ca[j].cdp) {
+				schmt.l2ca[j].u.s.code_mask = default_l2ca;
+				schmt.l2ca[j].u.s.data_mask = default_l2ca;
+			} else
+				schmt.l2ca[j].u.ways_mask = default_l2ca;
+		}
+
+		for (j = 0; j < schmt.mba_num; j++)
+			schmt.mba[j].mb_rate = default_mba;
+
+		ret = resctrl_alloc_schemata_write(i, &schmt);
+
+		resctrl_alloc_schemata_fini(&schmt);
+
+		if (ret != PQOS_RETVAL_OK) {
+			LOG_ERROR("Error on schemata write "
+				  "for resctrl group %u\n", i);
+			goto os_alloc_reset_light_schematas_exit;
+		}
+	}
+
+ os_alloc_reset_light_schematas_exit:
+	if (ret != PQOS_RETVAL_OK)
+		resctrl_lock_release();
+	else
+		ret = resctrl_lock_release();
+
+	return ret;
+}
+
+/**
+ * @brief filter for scandir.
+ *
+ * Skips entries starting with "."
+ * Skips non-numeric entries
+ *
+ * @param[in] dir scandir dirent entry
+ *
+ * @retval 0 for entires to be skipped
+ * @retval 1 otherwise
+ */
+static int
+filter_pids(const struct dirent *dir)
+{
+	size_t char_idx;
+
+	if (dir->d_name[0] == '.')
+		return 0;
+
+        for (char_idx = 0; char_idx < strlen(dir->d_name); ++char_idx) {
+		if (!isdigit(dir->d_name[char_idx]))
+			return 0;
+        }
+
+        return 1;
+}
+
+/**
+ * @brief Move all tasks to COS0 (default)
+ *
+ * @return Operation status
+ */
+static int
+os_alloc_reset_tasks(void)
+{
+	struct dirent **pids_list = NULL;
+	int pid_count;
+	int pid_idx;
+	int alloc_result;
+	pid_t pid;
+	const int cos0 = 0;
+
+	LOG_INFO("OS alloc reset - tasks\n");
+
+	pid_count = scandir("/proc", &pids_list, filter_pids, NULL);
+
+	for (pid_idx = 0; pid_idx < pid_count; ++pid_idx) {
+		pid = atoi(pids_list[pid_idx]->d_name);
+		alloc_result = os_alloc_assoc_set_pid(pid, cos0);
+		if (alloc_result != PQOS_RETVAL_OK) {
+                        struct stat st;
+                        char path[128];
+
+                        snprintf(path, sizeof(path), "/proc/%d", pid);
+                        if (stat(path, &st) != 0) {
+                                LOG_DEBUG("Task %d no longer exists\n", pid);
+                                alloc_result = PQOS_RETVAL_OK;
+                                continue;
+                        }
+
+			LOG_ERROR("Error allocating task %d to COS%u\n",
+				   pid, cos0);
+			return alloc_result;
+		}
+	}
+
+	return PQOS_RETVAL_OK;
+}
+
+/**
+ * @brief Performs "light reset" of CAT.
+ *
+ * Moves all cores to default COS
+ * Resets all l3 schematas to default value
+ * Resets all l2 schematas to default value
+ * Resets all mba schematas to default value
+ * Moves all tasks to default COS
+ *
+ * @param [in] l3_cap id of default COS
+ * @param [in] l2_cap id of default COS
+ *
+ * @return Operation status
+ */
+static int
+os_alloc_reset_light(const struct pqos_cap_l3ca *l3_cap,
+		     const struct pqos_cap_l2ca *l2_cap)
+{
+	int ret = PQOS_RETVAL_OK;
+	int step_result;
+
+	LOG_INFO("OS alloc reset - LIGHT\n");
+
+	step_result = os_alloc_reset_cores();
+	if (step_result != PQOS_RETVAL_OK)
+		ret = step_result;
+
+	step_result = os_alloc_reset_schematas(l3_cap, l2_cap);
+	if (step_result != PQOS_RETVAL_OK)
+		ret = step_result;
+
+	step_result = os_alloc_reset_tasks();
+	if (step_result != PQOS_RETVAL_OK)
+		ret = step_result;
+
+	return ret;
+}
+
+/**
+ * @brief updates CDP for l2 cache capability
+ *
+ * @param [in] l2_cdp_cfg requsted l2 cdp configuration
+ * @param [in] l2_cap l2 capability
+ * @param [out] l2_cdp id of default COS
+ *
+ * @retval > 0 on l2_cdp change
+ * @retval 0 on no change
+ */
+static int
+l2_cdp_update(const enum pqos_cdp_config l2_cdp_cfg,
+	      const struct pqos_cap_l2ca *l2_cap,
+	      enum pqos_cdp_config *l2_cdp)
+{
+        int ret = 0;
+
+	if (l2_cap == NULL)
+		return 0;
+	switch (l2_cdp_cfg) {
+	case PQOS_REQUIRE_CDP_ON:
+		*l2_cdp = l2_cdp_cfg;
+                ret = !l2_cap->cdp_on;
+		break;
+	case PQOS_REQUIRE_CDP_ANY:
+                if (l2_cap->cdp_on)
+                        *l2_cdp = PQOS_REQUIRE_CDP_ON;
+                else
+                        *l2_cdp = PQOS_REQUIRE_CDP_OFF;
+		break;
+	case PQOS_REQUIRE_CDP_OFF:
+		*l2_cdp = l2_cdp_cfg;
+                ret = l2_cap->cdp_on;
+		break;
+	}
+
+	return ret;
+}
+
+/**
+ * @brief updates CDP for l3 cache capability
+ *
+ * @param [in] l3_cdp_cfg requsted l3 cdp configuration
+ * @param [in] l3_cap l3 capability
+ * @param [out] l3_cdp id of default COS
+ *
+ * @retval > 0 on l3_cdp change
+ * @retval 0 on no change
+ */
+static int
+l3_cdp_update(const enum pqos_cdp_config l3_cdp_cfg,
+	      const struct pqos_cap_l3ca *l3_cap,
+	      enum pqos_cdp_config *l3_cdp)
+{
+        int ret = 0;
+
+	if (l3_cap == NULL)
+		return 0;
+
+	switch (l3_cdp_cfg) {
+	case PQOS_REQUIRE_CDP_ON:
+		*l3_cdp = l3_cdp_cfg;
+                ret = !l3_cap->cdp_on;
+		break;
+	case PQOS_REQUIRE_CDP_ANY:
+                if (l3_cap->cdp_on)
+                        *l3_cdp = PQOS_REQUIRE_CDP_ON;
+                else
+                        *l3_cdp = PQOS_REQUIRE_CDP_OFF;
+		break;
+	case PQOS_REQUIRE_CDP_OFF:
+		*l3_cdp = l3_cdp_cfg;
+                ret = l3_cap->cdp_on;
+		break;
+	}
+
+	return ret;
+}
+
+/**
+ * @brief Performs "full reset" of CAT.
+ *
+ * Allocs all cores to default COS
+ * Remounts resctrl file system with new CDP configuration
+ *
+ * @param [in] l3_cdp_cfg requested L3 CAT CDP config
+ * @param [in] l2_cdp_cfg requested L2 CAT CDP config
+ * @param [in] l3_cap l3 capability
+ * @param [in] l2_cap l2 capability
+ *
+ * @return Operation status
+ */
+static int
+os_alloc_reset_full(const enum pqos_cdp_config l3_cdp_cfg,
+		    const enum pqos_cdp_config l2_cdp_cfg,
+	            const struct pqos_cap_l3ca *l3_cap,
+	            const struct pqos_cap_l2ca *l2_cap)
+{
+	int ret;
+
+        LOG_INFO("OS alloc reset - FULL\n");
+
+        /**
+         * Set the CPU assoc back to COS0
+         */
+        ret = os_alloc_reset_cores();
+	if (ret != PQOS_RETVAL_OK)
+		goto os_alloc_reset_full_exit;
+
+        /**
+         * Umount resctrl to reset schemata
+         */
+
+	LOG_INFO("OS alloc reset - unmount resctrl\n");
+        ret = resctrl_umount();
+        if (ret != PQOS_RETVAL_OK)
+                goto os_alloc_reset_full_exit;
+
+        /**
+         * Mount now with CDP option.
+         */
+	LOG_INFO("OS alloc reset - mount resctrl with "
+		"l3_cdp %s and l2_cdp %s\n",
+		l3_cdp_cfg ? "on" : "off",
+		l2_cdp_cfg ? "on" : "off");
+
+        ret = os_interface_mount(l3_cdp_cfg, l2_cdp_cfg);
+        if (ret != PQOS_RETVAL_OK) {
+                LOG_ERROR("Mount OS interface error!\n");
+                goto os_alloc_reset_full_exit;
+        }
+        if (l3_cap != NULL)
+                _pqos_cap_l3cdp_change(l3_cdp_cfg);
+        if (l2_cap != NULL)
+                _pqos_cap_l2cdp_change(l2_cdp_cfg);
+        /**
+         * Create the COS dir's in resctrl.
+         */
+        LOG_INFO("OS alloc reset - prepare resctrl fs\n");
+        ret = os_alloc_prep();
+        if (ret != PQOS_RETVAL_OK)
+                LOG_ERROR("OS alloc prep error!\n");
+
+ os_alloc_reset_full_exit:
         return ret;
 }
 
 int
-os_alloc_reset(const enum pqos_cdp_config l3_cdp_cfg)
+os_alloc_reset(const enum pqos_cdp_config l3_cdp_cfg,
+               const enum pqos_cdp_config l2_cdp_cfg)
 {
         const struct pqos_capability *alloc_cap = NULL;
         const struct pqos_cap_l3ca *l3_cap = NULL;
         const struct pqos_cap_l2ca *l2_cap = NULL;
-        int ret, cdp_mount, cdp_current = 0;
-        unsigned i, cos0 = 0;
-        struct resctrl_alloc_cpumask mask;
+        enum pqos_cdp_config l3_cdp = PQOS_REQUIRE_CDP_OFF;
+	enum pqos_cdp_config l2_cdp = PQOS_REQUIRE_CDP_OFF;
+	int l3_cdp_changed = 0;
+	int l2_cdp_changed = 0;
+        int ret;
 
         ASSERT(l3_cdp_cfg == PQOS_REQUIRE_CDP_ON ||
                l3_cdp_cfg == PQOS_REQUIRE_CDP_OFF ||
                l3_cdp_cfg == PQOS_REQUIRE_CDP_ANY);
 
+        ASSERT(l2_cdp_cfg == PQOS_REQUIRE_CDP_ON ||
+               l2_cdp_cfg == PQOS_REQUIRE_CDP_OFF ||
+               l2_cdp_cfg == PQOS_REQUIRE_CDP_ANY);
+
         /* Get L3 CAT capabilities */
         (void) pqos_cap_get_type(m_cap, PQOS_CAP_TYPE_L3CA, &alloc_cap);
-        if (alloc_cap != NULL) {
+        if (alloc_cap != NULL)
                 l3_cap = alloc_cap->u.l3ca;
-                cdp_current = l3_cap->cdp_on;
-        }
 
         /* Get L2 CAT capabilities */
         alloc_cap = NULL;
@@ -462,73 +901,68 @@ os_alloc_reset(const enum pqos_cdp_config l3_cdp_cfg)
 
         /* Check if either L2 CAT or L3 CAT is supported */
         if (l2_cap == NULL && l3_cap == NULL) {
-                LOG_ERROR("L2 CAT/L3 CAT not present!\n");
-                ret = PQOS_RETVAL_RESOURCE; /* no L2/L3 CAT present */
-                goto os_alloc_reset_exit;
+		LOG_ERROR("L2 CAT/L3 CAT not present!\n");
+		ret = PQOS_RETVAL_RESOURCE; /* no L2/L3 CAT present */
+		goto os_alloc_reset_exit;
         }
         /* Check L3 CDP requested while not present */
         if (l3_cap == NULL && l3_cdp_cfg != PQOS_REQUIRE_CDP_ANY) {
-                LOG_ERROR("L3 CDP setting requested but no L3 CAT present!\n");
+		LOG_ERROR("L3 CDP setting requested but no L3 CAT present!\n");
+		ret = PQOS_RETVAL_RESOURCE;
+		goto os_alloc_reset_exit;
+        }
+        /* Check against erroneous CDP request */
+        if (l3_cap != NULL && l3_cdp_cfg == PQOS_REQUIRE_CDP_ON &&
+		!l3_cap->os_cdp) {
+		LOG_ERROR("L3 CAT/CDP requested but not supported by the "
+                          "platform!\n");
+		ret = PQOS_RETVAL_PARAM;
+		goto os_alloc_reset_exit;
+        }
+        /* Check L2 CDP requested while not present */
+        if (l2_cap == NULL && l2_cdp_cfg != PQOS_REQUIRE_CDP_ANY) {
+                LOG_ERROR("L2 CDP setting requested but no L2 CAT present!\n");
                 ret = PQOS_RETVAL_RESOURCE;
                 goto os_alloc_reset_exit;
         }
-        /* Check against erroneous CDP request */
-        if (l3_cdp_cfg == PQOS_REQUIRE_CDP_ON && !l3_cap->cdp) {
-                LOG_ERROR("CAT/CDP requested but not supported by the "
+        /* Check against erroneous L2 CDP request */
+        if (l2_cap != NULL && l2_cdp_cfg == PQOS_REQUIRE_CDP_ON &&
+                !l2_cap->os_cdp) {
+                LOG_ERROR("L2 CAT/CDP requested but not supported by the "
                           "platform!\n");
                 ret = PQOS_RETVAL_PARAM;
                 goto os_alloc_reset_exit;
         }
 
-        /**
-         * Set the CPU assoc back to COS0
-         */
-        ret = resctrl_alloc_cpumask_read(cos0, &mask);
-	if (ret != PQOS_RETVAL_OK)
-		return ret;
-        for (i = 0; i < m_cpu->num_cores; i++)
-                resctrl_alloc_cpumask_set(i, &mask);
-
-        ret = resctrl_alloc_cpumask_write(cos0, &mask);
-        if (ret != PQOS_RETVAL_OK) {
-                LOG_ERROR("CPU assoc reset failed\n");
-                return ret;
-        }
-
-        /**
-         * Umount resctrl to reset schemata
-         */
-        ret = umount2(RESCTRL_ALLOC_PATH, 0);
-        if (ret != 0) {
-                LOG_ERROR("Umount OS interface error!\n");
-                goto os_alloc_reset_exit;
-        }
-        /**
-         * Turn L3 CDP ON or OFF
-         */
-        if (l3_cdp_cfg == PQOS_REQUIRE_CDP_ON)
-                cdp_mount = 1;
-        else if (l3_cdp_cfg == PQOS_REQUIRE_CDP_ANY)
-                cdp_mount = cdp_current;
-        else
-                cdp_mount = 0;
-
-        /**
-         * Mount now with CDP option.
-         */
-        ret = os_interface_mount(cdp_mount);
-        if (ret != PQOS_RETVAL_OK) {
-                LOG_ERROR("Mount OS interface error!\n");
-                goto os_alloc_reset_exit;
-        }
-        if (cdp_mount != cdp_current)
-                _pqos_cap_l3cdp_change(cdp_current, cdp_mount);
-        /**
-         * Create the COS dir's in resctrl.
-         */
-        ret = os_alloc_prep();
+        /** Check if resctrl is in use */
+        ret = resctrl_lock_exclusive();
         if (ret != PQOS_RETVAL_OK)
-                LOG_ERROR("OS alloc prep error!\n");
+                goto os_alloc_reset_exit;
+        resctrl_lock_release();
+
+        l3_cdp_changed = l3_cdp_update(l3_cdp_cfg, l3_cap, &l3_cdp);
+        l2_cdp_changed = l2_cdp_update(l2_cdp_cfg, l2_cap, &l2_cdp);
+
+        if (l3_cdp_changed || l2_cdp_changed) {
+
+		unsigned monitoring_active = 0;
+
+		ret = resctrl_mon_active(&monitoring_active);
+		if (ret != PQOS_RETVAL_OK) {
+			LOG_ERROR("Failed to check resctrl "
+				  "monitoring activity\n");
+			goto os_alloc_reset_exit;
+		}
+
+		if (monitoring_active > 0) {
+			LOG_ERROR("Failed to reset allocation. Please stop "
+				  "monitoring in order to change CDP settings\n");
+			ret = PQOS_RETVAL_ERROR;
+		} else
+			ret = os_alloc_reset_full(l3_cdp, l2_cdp, l3_cap,
+                                                  l2_cap);
+        } else
+		ret = os_alloc_reset_light(l3_cap, l2_cap);
 
  os_alloc_reset_exit:
         return ret;
@@ -578,14 +1012,18 @@ os_l3ca_set(const unsigned socket,
 	if (ret != PQOS_RETVAL_OK)
 		goto os_l3ca_set_exit;
 
+        ret = resctrl_lock_exclusive();
+        if (ret != PQOS_RETVAL_OK)
+                goto os_l3ca_set_exit;
+
 	for (i = 0; i < num_cos; i++) {
 		struct resctrl_alloc_schemata schmt;
 
 		if (ca[i].cdp == 1 && cdp_enabled == 0) {
-			LOG_ERROR("Attempting to set CDP COS while CDP "
+			LOG_ERROR("Attempting to set CDP COS while L3 CDP "
 			          "is disabled!\n");
 			ret = PQOS_RETVAL_ERROR;
-			goto os_l3ca_set_exit;
+			goto os_l3ca_set_unlock;
 		}
 
 		ret = resctrl_alloc_schemata_init(ca[i].class_id, m_cap, m_cpu,
@@ -614,8 +1052,11 @@ os_l3ca_set(const unsigned socket,
 		resctrl_alloc_schemata_fini(&schmt);
 
 		if (ret != PQOS_RETVAL_OK)
-			goto os_l3ca_set_exit;
+			goto os_l3ca_set_unlock;
 	}
+
+ os_l3ca_set_unlock:
+        resctrl_lock_release();
 
  os_l3ca_set_exit:
 	if (sockets != NULL)
@@ -664,6 +1105,10 @@ os_l3ca_get(const unsigned socket,
 		goto os_l3ca_get_exit;
 	}
 
+        ret = resctrl_lock_shared();
+        if (ret != PQOS_RETVAL_OK)
+                goto os_l3ca_get_exit;
+
 	for (class_id = 0; class_id < count; class_id++) {
 		struct resctrl_alloc_schemata schmt;
 
@@ -678,9 +1123,12 @@ os_l3ca_get(const unsigned socket,
 		resctrl_alloc_schemata_fini(&schmt);
 
 		if (ret != PQOS_RETVAL_OK)
-			goto os_l3ca_get_exit;
+			goto os_l3ca_get_unlock;
 	}
 	*num_ca = count;
+
+ os_l3ca_get_unlock:
+        resctrl_lock_release();
 
  os_l3ca_get_exit:
 	if (sockets != NULL)
@@ -708,8 +1156,7 @@ os_l3ca_get_min_cbm_bits(unsigned *min_cbm_bits)
 		return PQOS_RETVAL_RESOURCE; /* L3 CAT not supported */
 
 	memset(buf, 0, sizeof(buf));
-	snprintf(buf, sizeof(buf) - 1, "%s/info/L3/min_cbm_bits",
-	         RESCTRL_ALLOC_PATH);
+	snprintf(buf, sizeof(buf) - 1, "%s/info/L3/min_cbm_bits", RESCTRL_PATH);
 
 	fd = fopen(buf, "r");
 	if (fd == NULL)
@@ -733,6 +1180,7 @@ os_l2ca_set(const unsigned l2id,
 	unsigned l2ids_num = 0;
 	unsigned *l2ids = NULL;
 	unsigned num_grps = 0, l2ca_num;
+        int cdp_enabled;
 
 	ASSERT(m_cap != NULL);
 	ASSERT(ca != NULL);
@@ -748,6 +1196,10 @@ os_l2ca_set(const unsigned l2id,
 
 	if (num_cos > num_grps)
 		return PQOS_RETVAL_PARAM;
+
+        ret = pqos_l2ca_cdp_enabled(m_cap, NULL, &cdp_enabled);
+        if (ret != PQOS_RETVAL_OK)
+                goto os_l2ca_set_exit;
 
 	/*
 	 * Check if class id's are within allowed range.
@@ -772,8 +1224,19 @@ os_l2ca_set(const unsigned l2id,
 		goto os_l2ca_set_exit;
 	}
 
+        ret = resctrl_lock_exclusive();
+        if (ret != PQOS_RETVAL_OK)
+                goto os_l2ca_set_exit;
+
 	for (i = 0; i < num_cos; i++) {
 		struct resctrl_alloc_schemata schmt;
+
+                if (ca[i].cdp == 1 && cdp_enabled == 0) {
+                        LOG_ERROR("Attempting to set CDP COS while L2 CDP "
+                                  "is disabled!\n");
+                        ret = PQOS_RETVAL_ERROR;
+                        goto os_l2ca_set_unlock;
+                }
 
 		ret = resctrl_alloc_schemata_init(ca[i].class_id, m_cap, m_cpu,
 		                                  &schmt);
@@ -783,17 +1246,29 @@ os_l2ca_set(const unsigned l2id,
 			ret = resctrl_alloc_schemata_read(ca[i].class_id,
 			                                  &schmt);
 
-		if (ret == PQOS_RETVAL_OK) {
-			schmt.l2ca[l2id] = ca[i];
-			ret = resctrl_alloc_schemata_write(ca[i].class_id,
-			                                   &schmt);
-		}
+                /* update and write schemata */
+                if (ret == PQOS_RETVAL_OK) {
+                        struct pqos_l2ca *l2ca = &(schmt.l2ca[l2id]);
+
+                        if (cdp_enabled == 1 && ca[i].cdp == 0) {
+                                l2ca->cdp = 1;
+                                l2ca->u.s.data_mask = ca[i].u.ways_mask;
+                                l2ca->u.s.code_mask = ca[i].u.ways_mask;
+                        } else
+                                *l2ca = ca[i];
+
+                        ret = resctrl_alloc_schemata_write(ca[i].class_id,
+                                                           &schmt);
+                }
 
 		resctrl_alloc_schemata_fini(&schmt);
 
 		if (ret != PQOS_RETVAL_OK)
-			goto os_l2ca_set_exit;
+			goto os_l2ca_set_unlock;
 	}
+
+ os_l2ca_set_unlock:
+        resctrl_lock_release();
 
  os_l2ca_set_exit:
 	if (l2ids != NULL)
@@ -843,6 +1318,11 @@ os_l2ca_get(const unsigned l2id,
 		goto os_l2ca_get_exit;
 	}
 
+
+        ret = resctrl_lock_shared();
+        if (ret != PQOS_RETVAL_OK)
+                goto os_l2ca_get_exit;
+
 	for (class_id = 0; class_id < count; class_id++) {
 		struct resctrl_alloc_schemata schmt;
 
@@ -857,9 +1337,12 @@ os_l2ca_get(const unsigned l2id,
 		resctrl_alloc_schemata_fini(&schmt);
 
 		if (ret != PQOS_RETVAL_OK)
-			goto os_l2ca_get_exit;
+			goto os_l2ca_get_unlock;
 	}
 	*num_ca = count;
+
+ os_l2ca_get_unlock:
+        resctrl_lock_release();
 
  os_l2ca_get_exit:
 	if (l2ids != NULL)
@@ -887,8 +1370,7 @@ os_l2ca_get_min_cbm_bits(unsigned *min_cbm_bits)
 		return PQOS_RETVAL_RESOURCE; /* L2 CAT not supported */
 
 	memset(buf, 0, sizeof(buf));
-	snprintf(buf, sizeof(buf) - 1, "%s/info/L2/min_cbm_bits",
-	         RESCTRL_ALLOC_PATH);
+	snprintf(buf, sizeof(buf) - 1, "%s/info/L2/min_cbm_bits", RESCTRL_PATH);
 
 	fd = fopen(buf, "r");
 	if (fd == NULL)
@@ -953,6 +1435,10 @@ os_mba_set(const unsigned socket,
 		goto os_l3ca_set_exit;
 	}
 
+        ret = resctrl_lock_exclusive();
+        if (ret != PQOS_RETVAL_OK)
+                goto os_l3ca_set_exit;
+
 	for (i = 0; i < num_cos; i++) {
 		struct resctrl_alloc_schemata schmt;
 
@@ -991,8 +1477,11 @@ os_mba_set(const unsigned socket,
 		resctrl_alloc_schemata_fini(&schmt);
 
 		if (ret != PQOS_RETVAL_OK)
-			goto os_l3ca_set_exit;
+			goto os_l3ca_set_unlock;
 	}
+
+ os_l3ca_set_unlock:
+        resctrl_lock_release();
 
  os_l3ca_set_exit:
 	if (sockets != NULL)
@@ -1040,6 +1529,10 @@ os_mba_get(const unsigned socket,
 		goto os_mba_get_exit;
 	}
 
+        ret = resctrl_lock_shared();
+        if (ret != PQOS_RETVAL_OK)
+                goto os_mba_get_exit;
+
 	for (class_id = 0; class_id < count; class_id++) {
 		struct resctrl_alloc_schemata schmt;
 
@@ -1054,9 +1547,12 @@ os_mba_get(const unsigned socket,
 		resctrl_alloc_schemata_fini(&schmt);
 
 		if (ret != PQOS_RETVAL_OK)
-			goto os_mba_get_exit;
+			goto os_mba_get_unlock;
 	}
 	*num_cos = count;
+
+ os_mba_get_unlock:
+        resctrl_lock_release();
 
  os_mba_get_exit:
 	if (sockets != NULL)
@@ -1071,6 +1567,8 @@ os_alloc_assoc_set_pid(const pid_t task,
 {
         int ret;
 	unsigned max_cos = 0;
+        int ret_mon;
+        char mon_group[256];
 
         ASSERT(m_cap != NULL);
 
@@ -1084,18 +1582,56 @@ os_alloc_assoc_set_pid(const pid_t task,
                 return PQOS_RETVAL_PARAM;
         }
 
+        ret = resctrl_lock_exclusive();
+        if (ret != PQOS_RETVAL_OK)
+                return ret;
+
+        /*
+         * When task is moved to different COS we need to update monitoring
+         * groups. Obtain monitoring group name
+         */
+        ret_mon = resctrl_mon_assoc_get_pid(task, mon_group, sizeof(mon_group));
+        if (ret_mon != PQOS_RETVAL_OK && ret_mon != PQOS_RETVAL_RESOURCE)
+                LOG_WARN("Failed to obtain monitoring group assigment for "
+                         "task %d\n", task);
+
         /* Write to tasks file */
-	return resctrl_alloc_task_write(class_id, task);
+        ret = resctrl_alloc_assoc_set_pid(task, class_id);
+        if (ret != PQOS_RETVAL_OK)
+                goto os_alloc_assoc_set_pid_exit;
+
+        /* Task monitoring was started assign it back to monitoring group */
+        if (ret_mon == PQOS_RETVAL_OK) {
+                ret_mon = resctrl_mon_assoc_set_pid(task, mon_group);
+                if (ret_mon != PQOS_RETVAL_OK)
+                        LOG_WARN("Could not assign task %d back to monitoring "
+                                 "group\n", task);
+        }
+
+ os_alloc_assoc_set_pid_exit:
+        resctrl_lock_release();
+
+        return ret;
 }
 
 int
 os_alloc_assoc_get_pid(const pid_t task,
                        unsigned *class_id)
 {
+        int ret;
+
         ASSERT(class_id != NULL);
 
+        ret = resctrl_lock_shared();
+        if (ret != PQOS_RETVAL_OK)
+                return ret;
+
         /* Search tasks files */
-        return resctrl_alloc_task_search(class_id, m_cap, task);
+        ret = resctrl_alloc_assoc_get_pid(task, class_id);
+
+        resctrl_lock_release();
+
+        return ret;
 }
 
 int
@@ -1121,17 +1657,24 @@ os_alloc_assign_pid(const unsigned technology,
         if (num_rctl_grps == 0)
                 return PQOS_RETVAL_ERROR;
 
+        ret = resctrl_lock_exclusive();
+        if (ret != PQOS_RETVAL_OK)
+                return ret;
+
         /* find an unused class from highest down */
         ret = get_unused_cos(num_rctl_grps - 1, class_id);
         if (ret != PQOS_RETVAL_OK)
-                return ret;
+                goto os_alloc_assign_pid_unlock;
 
         /* assign tasks to the unused class */
         for (i = 0; i < task_num; i++) {
                 ret = resctrl_alloc_task_write(*class_id, task_array[i]);
                 if (ret != PQOS_RETVAL_OK)
-                        return ret;
+                        goto os_alloc_assign_pid_unlock;
         }
+
+ os_alloc_assign_pid_unlock:
+        resctrl_lock_release();
 
         return ret;
 }
@@ -1146,6 +1689,10 @@ os_alloc_release_pid(const pid_t *task_array,
         ASSERT(task_array != NULL);
         ASSERT(task_num != 0);
 
+        ret = resctrl_lock_exclusive();
+        if (ret != PQOS_RETVAL_OK)
+                return ret;
+
         /**
          * Write all tasks to default COS#0 tasks file
          * - return on error
@@ -1153,9 +1700,12 @@ os_alloc_release_pid(const pid_t *task_array,
          */
         for (i = 0; i < task_num; i++) {
                 ret = resctrl_alloc_task_write(0, task_array[i]);
-		if (ret == PQOS_RETVAL_ERROR)
-                        return PQOS_RETVAL_ERROR;
+		if (ret != PQOS_RETVAL_OK)
+                        goto os_alloc_release_pid_unlock;
 	}
 
-        return PQOS_RETVAL_OK;
+ os_alloc_release_pid_unlock:
+        resctrl_lock_release();
+
+        return ret;
 }

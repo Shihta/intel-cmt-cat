@@ -1,7 +1,7 @@
 /*
  * BSD LICENSE
  *
- * Copyright(c) 2014-2017 Intel Corporation. All rights reserved.
+ * Copyright(c) 2014-2018 Intel Corporation. All rights reserved.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -57,7 +57,7 @@ extern "C" {
  * =======================================
  */
 
-#define PQOS_VERSION       10200        /**< version 1.2.0 */
+#define PQOS_VERSION       20000        /**< version 2.0.0 */
 #define PQOS_MAX_L3CA_COS  16           /**< 16 x COS */
 #define PQOS_MAX_L2CA_COS  16           /**< 16 x COS */
 
@@ -74,14 +74,18 @@ extern "C" {
 #define PQOS_RETVAL_TRANSPORT    5      /**< transport error */
 #define PQOS_RETVAL_PERF_CTR     6      /**< performance counter error */
 #define PQOS_RETVAL_BUSY         7      /**< resource busy error */
+#define PQOS_RETVAL_INTER        8      /**< Interface not supported */
 
 /*
  * =======================================
  * Interface values
  * =======================================
  */
-#define PQOS_INTER_MSR            0      /**< MSR */
-#define PQOS_INTER_OS             1      /**< OS */
+enum pqos_interface {
+        PQOS_INTER_MSR            = 0,  /**< MSR */
+        PQOS_INTER_OS             = 1,  /**< OS */
+        PQOS_INTER_OS_RESCTRL_MON = 2   /**< OS with resctrl monitoring */
+};
 
 /*
  * =======================================
@@ -116,15 +120,17 @@ enum pqos_cdp_config {
  *         LOG_VER_SUPER_VERBOSE  - warning, error, info and debug messages
  *
  * @param interface preference
- *         PQOS_INTER_MSR      - MSR interface or nothing
- *         PQOS_INTER_OS       - OS interface or nothing
+ *         PQOS_INTER_MSR            - MSR interface or nothing
+ *         PQOS_INTER_OS             - OS interface or nothing
+ *         PQOS_INTER_OS_RESCTRL_MON - OS interface with resctrl monitoring
+ *                                     or nothing
  */
 struct pqos_config {
         int fd_log;
         void (*callback_log)(void *, const size_t, const char *);
         void *context_log;
         int verbose;
-        int interface;
+        enum pqos_interface interface;
 };
 
 /**
@@ -184,7 +190,9 @@ struct pqos_cap_l3ca {
         int cdp;                        /**< code data prioritization feature
                                            presence */
         int cdp_on;                     /**< code data prioritization on or
-                                           off*/
+                                           off */
+        int os_cdp;                     /**< flag to show if CDP is supported
+                                        by OS interface */
 };
 
 /**
@@ -196,6 +204,12 @@ struct pqos_cap_l2ca {
         unsigned num_ways;              /**< number of cache ways */
         unsigned way_size;              /**< way size in bytes */
         uint64_t way_contention;        /**< ways contention bit mask */
+        int cdp;                        /**< code data prioritization feature
+                                           presence */
+        int cdp_on;                     /**< code data prioritization on or
+                                           off */
+        int os_cdp;                     /**< flag to show if CDP is supported
+                                           by OS interface */
 };
 
 /**
@@ -226,6 +240,15 @@ enum pqos_mon_event {
 };
 
 /**
+ * OS monitoring status
+ */
+enum pqos_os_mon {
+        PQOS_OS_MON_UNSUPPORTED = 0,    /**< OS monitoring is not supported */
+        PQOS_OS_MON_PERF        = 1,    /**< Perf monitoring is supported */
+        PQOS_OS_MON_RESCTRL     = 2     /**< Resctrl monitoring is supported */
+};
+
+/**
  * Monitoring capabilities structure
  *
  * Few assumptions here:
@@ -242,8 +265,8 @@ struct pqos_monitor {
                                            this event */
         uint32_t scale_factor;          /**< factor to scale RMID value
                                            to bytes */
-        int os_support;                 /**< flag to show if OS monitoring
-                                           is supported */
+        enum pqos_os_mon os_support;    /**< flag to show if OS monitoring
+                                           supported */
 };
 
 struct pqos_cap_mon {
@@ -371,6 +394,18 @@ struct pqos_mon_poll_ctx {
 };
 
 /**
+ * Perf monitoring poll context
+ */
+struct pqos_mon_perf_ctx {
+        int fd_llc;
+        int fd_mbl;
+        int fd_mbt;
+        int fd_inst;
+        int fd_cyc;
+        int fd_llc_misses;
+};
+
+/**
  * Monitoring group data structure
  */
 struct pqos_mon_data {
@@ -383,19 +418,26 @@ struct pqos_mon_data {
                                            pointer */
         struct pqos_event_values values; /**< RMID events value */
 
-        pid_t pid; /**< if not zero then this group tracks a process */
-
         /**
          * Task specific section
          */
-        int tid_nr;
+        unsigned num_pids;              /**< number of pids in the group */
+        pid_t *pids;                    /**< list of pids in the group */
+        unsigned tid_nr;
         pid_t *tid_map;
-        int *fds_llc;
-        int *fds_mbl;
-        int *fds_mbt;
-        int *fds_inst;
-        int *fds_cyc;
-        int *fds_llc_misses;
+
+        /**
+         * Perf specific section
+         */
+        struct pqos_mon_perf_ctx *perf; /**< Perf poll context for each
+                                           core/tid */
+        enum pqos_mon_event perf_event; /**< Started perf events */
+
+        /**
+         * Resctrl specific section
+         */
+        enum pqos_mon_event resctrl_event;
+        char *resctrl_group;
 
         /**
          * Core specific section
@@ -471,6 +513,53 @@ int pqos_mon_start_pid(const pid_t pid,
                        const enum pqos_mon_event event,
                        void *context,
                        struct pqos_mon_data *group);
+
+/**
+ * @brief Starts resource monitoring of selected \a pids (processes)
+ *
+ * @param [in] num_pids number of pids in \a pids array
+ * @param [in] pids array of process ID
+ * @param [in] event monitoring event id
+ * @param [in] context a pointer for application's convenience
+ *             (unused by the library)
+ * @param [in,out] group a pointer to monitoring structure
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int pqos_mon_start_pids(const unsigned num_pids,
+                        const pid_t *pids,
+                        const enum pqos_mon_event event,
+                        void *context,
+                        struct pqos_mon_data *group);
+
+/**
+ * @brief Adds pids to the resource monitoring grpup
+ *
+ * @param [in] num_pids number of pids in \a pids array
+ * @param [in] pids array of process ID
+ * @param [in,out] group a pointer to monitoring structure
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int pqos_mon_add_pids(const unsigned num_pids,
+                      const pid_t *pids,
+                      struct pqos_mon_data *group);
+
+/**
+ * @brief Remove pids from the resource monitoring grpup
+ *
+ * @param [in] num_pids number of pids in \a pids array
+ * @param [in] pids array of process ID
+ * @param [in,out] group a pointer to monitoring structure
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int pqos_mon_remove_pids(const unsigned num_pids,
+                         const pid_t *pids,
+                         struct pqos_mon_data *group);
 
 /**
  * @brief Stops resource monitoring data for selected monitoring group
@@ -629,15 +718,17 @@ int pqos_alloc_release_pid(const pid_t *task_array,
  * - all COS are set to give access to entire resource
  *
  * As part of allocation reset CDP reconfiguration can be performed.
- * This can be requested via \a l3_cdp_cfg.
+ * This can be requested via \a l3_cdp_cfg and \a l2_cdp_cfg.
  *
  * @param [in] l3_cdp_cfg requested L3 CAT CDP config
+ * @param [in] l2_cdp_cfg requested L2 CAT CDP config
  *
  * @return Operation status
  * @retval PQOS_RETVAL_OK on success
  */
 int
-pqos_alloc_reset(const enum pqos_cdp_config l3_cdp_cfg);
+pqos_alloc_reset(const enum pqos_cdp_config l3_cdp_cfg,
+                 const enum pqos_cdp_config l2_cdp_cfg);
 
 /*
  * =======================================
@@ -714,8 +805,15 @@ int pqos_l3ca_get_min_cbm_bits(unsigned *min_cbm_bits);
  * L2 cache allocation class of service data structure
  */
 struct pqos_l2ca {
-        unsigned class_id;      /**< class of service */
-        uint32_t ways_mask;     /**< bit mask for L2 cache ways */
+        unsigned class_id;              /**< class of service */
+        int cdp;                        /**< data & code masks used if true */
+        union {
+                uint64_t ways_mask;     /**< bit mask for L2 cache ways */
+                struct {
+                        uint64_t data_mask;
+                        uint64_t code_mask;
+                } s;
+        } u;
 };
 
 /**
@@ -1047,18 +1145,34 @@ pqos_mba_get_cos_num(const struct pqos_cap *cap,
                      unsigned *cos_num);
 
 /**
- * @brief Retrieves CDP status
+ * @brief Retrieves L3 CDP status
  *
  * @param [in] cap platform QoS capabilities structure
  *                 returned by \a pqos_cap_get
- * @param [out] cdp_supported place to store CDP support status
- * @param [out] cdp_enabled place to store CDP enable status
+ * @param [out] cdp_supported place to store L3 CDP support status
+ * @param [out] cdp_enabled place to store L3 CDP enable status
  *
  * @return Operation status
  * @retval PQOS_RETVAL_OK on success
  */
 int
 pqos_l3ca_cdp_enabled(const struct pqos_cap *cap,
+                      int *cdp_supported,
+                      int *cdp_enabled);
+
+/**
+ * @brief Retrieves L2 CDP status
+ *
+ * @param [in] cap platform QoS capabilities structure
+ *                 returned by \a pqos_cap_get
+ * @param [out] cdp_supported place to store L2 CDP support status
+ * @param [out] cdp_enabled place to store L2 CDP enable status
+ *
+ * @return Operation status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int
+pqos_l2ca_cdp_enabled(const struct pqos_cap *cap,
                       int *cdp_supported,
                       int *cdp_enabled);
 
@@ -1076,8 +1190,8 @@ pqos_mon_get_event_value(void * const value,
                          const enum pqos_mon_event event_id,
                          const struct pqos_mon_data * const group)
 {
-        uint64_t * const p_64 = value;
-        double * const p_dbl = value;
+        uint64_t * const p_64 = (uint64_t *)value;
+        double * const p_dbl = (double *)value;
 
 	if (group == NULL || value == NULL)
 		return PQOS_RETVAL_PARAM;

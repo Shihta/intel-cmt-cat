@@ -1,7 +1,7 @@
 /*
  * BSD LICENSE
  *
- * Copyright(c) 2014-2017 Intel Corporation. All rights reserved.
+ * Copyright(c) 2014-2018 Intel Corporation. All rights reserved.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -54,9 +54,14 @@
 #include "cap.h"
 
 /**
- * Default CDP configuration option - don't enforce on or off
+ * Default L3 CDP configuration option - don't enforce on or off
  */
 static enum pqos_cdp_config selfn_l3cdp_config = PQOS_REQUIRE_CDP_ANY;
+
+/**
+ * Default L2 CDP configuration option - don't enforce on or off
+ */
+static enum pqos_cdp_config selfn_l2cdp_config = PQOS_REQUIRE_CDP_ANY;
 
 /**
  * Monitoring reset
@@ -106,7 +111,7 @@ static int sel_display_verbose = 0;
 /**
  * Selected library interface
  */
-int sel_interface = PQOS_INTER_MSR;
+enum pqos_interface sel_interface = PQOS_INTER_MSR;
 
 /**
  * @brief Function to check if a value is already contained in a table
@@ -304,26 +309,55 @@ selfn_super_verbose_mode(const char *arg)
 static void selfn_reset_alloc(const char *arg)
 {
         if (arg != NULL && (strlen(arg) > 0)) {
+                unsigned i;
+                char *tok = NULL;
+                char *saveptr = NULL;
+                char *s = NULL;
+
+                selfn_strdup(&s, arg);
+
                 const struct {
                         const char *name;
                         enum pqos_cdp_config cdp;
-                } patterns[] = {
+                } patternsl3[] = {
                         {"l3cdp-on",  PQOS_REQUIRE_CDP_ON},
                         {"l3cdp-off", PQOS_REQUIRE_CDP_OFF},
                         {"l3cdp-any", PQOS_REQUIRE_CDP_ANY},
+                }, patternsl2[] = {
+                        {"l2cdp-on",  PQOS_REQUIRE_CDP_ON},
+                        {"l2cdp-off", PQOS_REQUIRE_CDP_OFF},
+                        {"l2cdp-any", PQOS_REQUIRE_CDP_ANY},
                 };
-                unsigned i;
 
-                for (i = 0; i < DIM(patterns); i++)
-                        if (strcasecmp(arg, patterns[i].name) == 0)
-                                break;
+                tok = s;
+                while ((tok = strtok_r(tok, ",", &saveptr)) != NULL) {
+                        unsigned valid = 0;
 
-                if (i >= DIM(patterns)) {
-                        printf("Unrecognized '%s' allocation "
-                               "reset option!\n", arg);
-                        exit(EXIT_FAILURE);
+                        for (i = 0; i < DIM(patternsl3); i++)
+                                if (strcasecmp(tok, patternsl3[i].name) == 0) {
+                                        selfn_l3cdp_config = patternsl3[i].cdp;
+                                        valid = 1;
+                                        break;
+                                }
+
+                        for (i = 0; i < DIM(patternsl2); i++)
+                                if (strcasecmp(tok, patternsl2[i].name) == 0) {
+                                        selfn_l2cdp_config = patternsl2[i].cdp;
+                                        valid = 1;
+                                        break;
+                                }
+
+                        if (!valid) {
+                                printf("Unrecognized '%s' allocation "
+                                       "reset option!\n", tok);
+                                free(s);
+                                exit(EXIT_FAILURE);
+                        }
+
+                        tok = NULL;
                 }
-                selfn_l3cdp_config = patterns[i].cdp;
+
+                free(s);
         }
         sel_reset_alloc = 1;
 }
@@ -518,6 +552,7 @@ static const char help_printf_long[] =
         "          Examples: 'llc:0=0xffff;llc:1=0x00ff;llc@0-1:2=0xff00',\n"
 	"                    'llc:0d=0xfff;llc:0c=0xfff00',\n"
         "                    'l2:2=0x3f;l2@2:1=0xf',\n"
+        "                    'l2:2d=0xf;l2:2c=0xc,\n"
         "                    'mba:1=30;mba@1:3=80'.\n"
         "  -a CLASS2ID, --alloc-assoc=CLASS2ID\n"
         "          associate cores/tasks with an allocation class.\n"
@@ -525,9 +560,11 @@ static const char help_printf_long[] =
         "          Example 'llc:0=0,2,4,6-10;llc:1=1'.\n"
         "          Example 'core:0=0,2,4,6-10;core:1=1'.\n"
         "          Example 'pid:0=3543,7643,4556;pid:1=7644'.\n"
-        "  -R [CONFIG], --alloc-reset[=CONFIG]\n"
+        "  -R [CONFIG[,CONFIG]], --alloc-reset[=CONFIG[,CONFIG]]\n"
         "          reset allocation configuration (L2/L3 CAT & MBA)\n"
-        "          CONFIG can be: l3cdp-on, l3cdp-off or l3cdp-any (default).\n"
+        "          CONFIG can be: l3cdp-on, l3cdp-off, l3cdp-any,\n"
+        "                         l2cdp-on, l2cdp-off, l2cdp-any\n"
+        "          (default l3cdp-any,l2cdp-any).\n"
         "  -m EVTCORES, --mon-core=EVTCORES\n"
         "          select cores and events for monitoring.\n"
         "          EVTCORES format is 'EVENT:CORE_LIST'.\n"
@@ -538,9 +575,13 @@ static const char help_printf_long[] =
         "          select top 10 most active (CPU utilizing) process ids to monitor\n"
         "          or select process ids and events to monitor.\n"
         "          EVTPIDS format is 'EVENT:PID_LIST'.\n"
-        "          Example 'llc:22,25673' or 'all:892,4588-4592'.\n"
-        "          Note: processes and cores cannot be monitored together.\n"
-        "                Requires Linux and kernel versions 4.1 and newer.\n"
+        "          Examples: 'llc:22,25673' or 'all:892,4588-4592'\n"
+        "          Process' IDs can be grouped by enclosing them in square brackets,\n"
+        "          Examples: 'llc:[22,25673]' or 'all:892,[4588-4592]'\n"
+        "          Note:\n"
+        "               Requires Linux and kernel versions 4.10 and newer.\n"
+        "               The -I option must be used for PID monitoring.\n"
+        "               Processes and cores cannot be monitored together.\n"
         "  -o FILE, --mon-file=FILE    output monitored data in a FILE\n"
         "  -u TYPE, --mon-file-type=TYPE\n"
         "          select output file format type for monitored data.\n"
@@ -573,7 +614,7 @@ static void print_help(const int is_long)
                m_cmd_name, m_cmd_name, m_cmd_name, m_cmd_name, m_cmd_name,
                m_cmd_name, m_cmd_name, m_cmd_name);
         if (is_long)
-                printf(help_printf_long);
+                printf("%s", help_printf_long);
 }
 
 static struct option long_cmd_opts[] = {
@@ -842,7 +883,9 @@ int main(int argc, char **argv)
                 /**
                  * Reset allocation configuration to after-reset state and exit
                  */
-                if (pqos_alloc_reset(selfn_l3cdp_config) != PQOS_RETVAL_OK) {
+                ret = pqos_alloc_reset(selfn_l3cdp_config,
+                                       selfn_l2cdp_config);
+                if (ret != PQOS_RETVAL_OK) {
                         exit_val = EXIT_FAILURE;
                         printf("Allocation reset failed!\n");
                 } else

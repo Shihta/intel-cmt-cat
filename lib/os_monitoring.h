@@ -61,6 +61,14 @@ int os_mon_init(const struct pqos_cpuinfo *cpu, const struct pqos_cap *cap);
  */
 int os_mon_fini(void);
 
+/**
+ * @brief OS interface to reset monitoring
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int os_mon_reset(void);
+
 /*
  * @brief This function stops all perf counters
  *
@@ -110,20 +118,55 @@ int os_mon_start(const unsigned num_cores,
  * @return Operations status
  * @retval PQOS_RETVAL_OK on success
  */
-int
-os_mon_poll(struct pqos_mon_data **groups,
-            const unsigned num_groups);
+int os_mon_poll(struct pqos_mon_data **groups,
+                const unsigned num_groups);
 
 /**
- * @brief This function starts all perf counters for a task
+ * @brief OS interface to start monitoring of selected group of \a pids
  *
- * @param group monitoring structure
+ * @param [in] num_pids number of pids in \a pids array
+ * @param [in] pids array of process ID
+ * @param [in] event monitoring event id
+ * @param [in] context a pointer for application's convenience
+ *             (unused by the library)
+ * @param [in,out] group a pointer to monitoring structure
  *
- * @return Operation status
+ * @return Operations status
  * @retval PQOS_RETVAL_OK on success
  */
-int
-os_mon_start_pid(struct pqos_mon_data *group);
+int os_mon_start_pids(const unsigned num_pids,
+                      const pid_t *pids,
+                      const enum pqos_mon_event event,
+                      void *context,
+                      struct pqos_mon_data *group);
+
+/**
+ * @brief OS interface to add \a pids to the monitoring group
+ *
+ * @param [in] num_pids number of pids in \a pids array
+ * @param [in] pids array of process ID
+ * @param [in,out] group a pointer to monitoring structure
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int os_mon_add_pids(const unsigned num_pids,
+                    const pid_t *pids,
+                    struct pqos_mon_data *group);
+
+/**
+ * @brief OS interface to remove \a pids from the monitoring group
+ *
+ * @param [in] num_pids number of pids in \a pids array
+ * @param [in] pids array of process ID
+ * @param [in,out] group a pointer to monitoring structure
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int os_mon_remove_pids(const unsigned num_pids,
+                       const pid_t *pids,
+                       struct pqos_mon_data *group);
 
 #ifdef __cplusplus
 }

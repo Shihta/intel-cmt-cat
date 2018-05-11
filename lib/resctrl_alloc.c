@@ -1,7 +1,7 @@
 /*
  * BSD LICENSE
  *
- * Copyright(c) 2017 Intel Corporation. All rights reserved.
+ * Copyright(c) 2017-2018 Intel Corporation. All rights reserved.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -41,12 +41,40 @@
 #include "types.h"
 #include "resctrl_alloc.h"
 
+/**
+ * ---------------------------------------
+ * Local data structures
+ * ---------------------------------------
+ */
+static const struct pqos_cap *m_cap = NULL;
+static const struct pqos_cpuinfo *m_cpu = NULL;
+
 /*
  * COS file names on resctrl file system
  */
 static const char *rctl_cpus = "cpus";
 static const char *rctl_schemata = "schemata";
 static const char *rctl_tasks = "tasks";
+
+int
+resctrl_alloc_init(const struct pqos_cpuinfo *cpu, const struct pqos_cap *cap)
+{
+        if (cpu == NULL || cap == NULL)
+		return PQOS_RETVAL_PARAM;
+
+	m_cap = cap;
+	m_cpu = cpu;
+
+        return PQOS_RETVAL_OK;
+}
+
+int
+resctrl_alloc_fini(void)
+{
+        m_cap = NULL;
+        m_cpu = NULL;
+        return PQOS_RETVAL_OK;
+}
 
 int
 resctrl_alloc_get_grps_num(const struct pqos_cap *cap, unsigned *grps_num)
@@ -161,10 +189,10 @@ resctrl_alloc_fopen(const unsigned class_id, const char *name, const char *mode)
 	memset(buf, 0, sizeof(buf));
 	if (class_id == 0)
 		result = snprintf(buf, sizeof(buf) - 1,
-				  "%s/%s", RESCTRL_ALLOC_PATH, name);
+				  "%s/%s", RESCTRL_PATH, name);
 	else
 		result = snprintf(buf, sizeof(buf) - 1, "%s/COS%u/%s",
-				  RESCTRL_ALLOC_PATH, class_id, name);
+				  RESCTRL_PATH, class_id, name);
 
 	if (result < 0)
 		return NULL;
@@ -214,119 +242,44 @@ resctrl_alloc_fclose(FILE *fd)
  * ---------------------------------------
  */
 
-void
-resctrl_alloc_cpumask_set(const unsigned lcore,
-                          struct resctrl_alloc_cpumask *mask)
-{
-	/* index in mask table */
-	const unsigned item = (sizeof(mask->tab) - 1) - (lcore / CHAR_BIT);
-	const unsigned bit = lcore % CHAR_BIT;
-
-	/* Set lcore bit in mask table item */
-	mask->tab[item] = mask->tab[item] | (1 << bit);
-}
-
-int
-resctrl_alloc_cpumask_get(const unsigned lcore,
-                          const struct resctrl_alloc_cpumask *mask)
-{
-	/* index in mask table */
-	const unsigned item = (sizeof(mask->tab) - 1) - (lcore / CHAR_BIT);
-	const unsigned bit = lcore % CHAR_BIT;
-
-	/* Check if lcore bit is set in mask table item */
-	return (mask->tab[item] >> bit) & 0x1;
-}
 
 int
 resctrl_alloc_cpumask_write(const unsigned class_id,
-	                    const struct resctrl_alloc_cpumask *mask)
+	                    const struct resctrl_cpumask *mask)
 {
 	int ret = PQOS_RETVAL_OK;
 	FILE *fd;
-	unsigned  i;
 
 	fd = resctrl_alloc_fopen(class_id, rctl_cpus, "w");
 	if (fd == NULL)
 		return PQOS_RETVAL_ERROR;
 
-	for (i = 0; i < sizeof(mask->tab); i++) {
-		const unsigned value = (unsigned) mask->tab[i];
-
-		if (fprintf(fd, "%02x", value) < 0) {
-			LOG_ERROR("Failed to write cpu mask\n");
-			break;
-		}
-		if ((i + 1) % 4 == 0)
-			if (fprintf(fd, ",") < 0) {
-				LOG_ERROR("Failed to write cpu mask\n");
-				break;
-			}
-	}
-	ret = resctrl_alloc_fclose(fd);
-
-	/* check if error occured in loop */
-	if (i < sizeof(mask->tab))
-		return PQOS_RETVAL_ERROR;
+	ret = resctrl_cpumask_write(fd, mask);
+	if (ret == PQOS_RETVAL_OK)
+		ret = resctrl_alloc_fclose(fd);
+	else
+		resctrl_alloc_fclose(fd);
 
 	return ret;
 }
 
 int
 resctrl_alloc_cpumask_read(const unsigned class_id,
-			   struct resctrl_alloc_cpumask *mask)
+			   struct resctrl_cpumask *mask)
 {
-	int i, hex_offset, idx;
+	int ret;
 	FILE *fd;
-	size_t num_chars = 0;
-	char cpus[RESCTRL_ALLOC_MAX_CPUS / CHAR_BIT];
 
-	memset(mask, 0, sizeof(struct resctrl_alloc_cpumask));
-	memset(cpus, 0, sizeof(cpus));
 	fd = resctrl_alloc_fopen(class_id, rctl_cpus, "r");
 	if (fd == NULL)
 		return PQOS_RETVAL_ERROR;
 
-	/** Read the entire file into memory. */
-	num_chars = fread(cpus, sizeof(char), sizeof(cpus), fd);
+	ret = resctrl_cpumask_read(fd, mask);
 
-	if (ferror(fd) != 0) {
-		LOG_ERROR("Error reading CPU file\n");
-		resctrl_alloc_fclose(fd);
-		return PQOS_RETVAL_ERROR;
-	}
-	cpus[sizeof(cpus) - 1] = '\0'; /** Just to be safe. */
 	if (resctrl_alloc_fclose(fd) != PQOS_RETVAL_OK)
 		return PQOS_RETVAL_ERROR;
 
-	/**
-	 *  Convert the cpus array into hex, skip any non hex chars.
-	 *  Store the hex values in the mask tab.
-	 */
-	for (i = num_chars - 1, hex_offset = 0, idx = sizeof(mask->tab) - 1;
-	     i >= 0; i--) {
-		const char c = cpus[i];
-		int hex_num;
-
-		if ('0' <= c && c <= '9')
-			hex_num = c - '0';
-		else if ('a' <= c && c <= 'f')
-			hex_num = 10 + c - 'a';
-		else if ('A' <= c && c <= 'F')
-			hex_num = 10 + c - 'A';
-		else
-			continue;
-
-		if (!hex_offset)
-			mask->tab[idx] = (uint8_t) hex_num;
-		else {
-			mask->tab[idx] |= (uint8_t) (hex_num << 4);
-			idx--;
-		}
-		hex_offset ^= 1;
-	}
-
-	return PQOS_RETVAL_OK;
+	return ret;
 }
 
 /*
@@ -370,6 +323,7 @@ resctrl_alloc_schemata_init(const unsigned class_id,
 	retval = pqos_l2ca_get_cos_num(cap, &num_cos);
 	if (retval == PQOS_RETVAL_OK && class_id < num_cos) {
 		unsigned *l2ids = NULL;
+		int cdp_enabled;
 
 		l2ids = pqos_cpu_get_l2ids(cpu, &num_ids);
 		if (l2ids == NULL) {
@@ -386,9 +340,15 @@ resctrl_alloc_schemata_init(const unsigned class_id,
 			goto resctrl_alloc_schemata_init_exit;
 		}
 
+		ret = pqos_l2ca_cdp_enabled(cap, NULL, &cdp_enabled);
+		if (ret != PQOS_RETVAL_OK)
+			goto resctrl_alloc_schemata_init_exit;
+
 		/* fill class_id */
-		for (i = 0; i < num_ids; i++)
+		for (i = 0; i < num_ids; i++) {
 			schemata->l2ca[i].class_id = class_id;
+			schemata->l2ca[i].cdp = cdp_enabled;
+		}
 	}
 
 	/* L3 */
@@ -463,7 +423,9 @@ resctrl_alloc_schemata_init(const unsigned class_id,
  */
 enum resctrl_alloc_schemata_type {
 	RESCTRL_ALLOC_SCHEMATA_TYPE_NONE,   /**< unknown */
-	RESCTRL_ALLOC_SCHEMATA_TYPE_L2,     /**< L2 CAT */
+	RESCTRL_ALLOC_SCHEMATA_TYPE_L2,     /**< L2 CAT without CDP */
+	RESCTRL_ALLOC_SCHEMATA_TYPE_L2CODE, /**< L2 CAT code */
+	RESCTRL_ALLOC_SCHEMATA_TYPE_L2DATA, /**< L2 CAT data */
 	RESCTRL_ALLOC_SCHEMATA_TYPE_L3,     /**< L3 CAT without CDP */
 	RESCTRL_ALLOC_SCHEMATA_TYPE_L3CODE, /**< L3 CAT code */
 	RESCTRL_ALLOC_SCHEMATA_TYPE_L3DATA, /**< L3 CAT data */
@@ -484,6 +446,10 @@ resctrl_alloc_schemata_type_get(const char *str)
 
 	if (strcasecmp(str, "L2") == 0)
 		type = RESCTRL_ALLOC_SCHEMATA_TYPE_L2;
+	else if (strcasecmp(str, "L2CODE") == 0)
+		type = RESCTRL_ALLOC_SCHEMATA_TYPE_L2CODE;
+	else if (strcasecmp(str, "L2DATA") == 0)
+		type = RESCTRL_ALLOC_SCHEMATA_TYPE_L2DATA;
 	else if (strcasecmp(str, "L3") == 0)
 		type = RESCTRL_ALLOC_SCHEMATA_TYPE_L3;
 	else if (strcasecmp(str, "L3CODE") == 0)
@@ -516,7 +482,17 @@ resctrl_alloc_schemata_set(const unsigned res_id,
 	if (type == RESCTRL_ALLOC_SCHEMATA_TYPE_L2) {
 		if (schemata->l2ca_num <= res_id)
 			return PQOS_RETVAL_ERROR;
-		schemata->l2ca[res_id].ways_mask = value;
+		schemata->l2ca[res_id].u.ways_mask = value;
+
+	} else if (type == RESCTRL_ALLOC_SCHEMATA_TYPE_L2CODE) {
+		if (schemata->l2ca_num <= res_id || !schemata->l2ca[res_id].cdp)
+			return PQOS_RETVAL_ERROR;
+		schemata->l2ca[res_id].u.s.code_mask = value;
+
+	} else if (type == RESCTRL_ALLOC_SCHEMATA_TYPE_L2DATA) {
+		if (schemata->l2ca_num <= res_id || !schemata->l2ca[res_id].cdp)
+			return PQOS_RETVAL_ERROR;
+		schemata->l2ca[res_id].u.s.data_mask = value;
 
 	} else if (type == RESCTRL_ALLOC_SCHEMATA_TYPE_L3) {
 		if (schemata->l3ca_num <= res_id || schemata->l3ca[res_id].cdp)
@@ -547,16 +523,24 @@ resctrl_alloc_schemata_read(const unsigned class_id,
 			    struct resctrl_alloc_schemata *schemata)
 {
 	int ret = PQOS_RETVAL_OK;
-	FILE *fd;
+	FILE *fd = NULL;
 	int type = RESCTRL_ALLOC_SCHEMATA_TYPE_NONE;
-	char buf[16 * 1024];
 	char *p = NULL, *q = NULL, *saveptr = NULL;
+	const size_t buf_size = 16 * 1024;
+	char *buf = calloc(buf_size, sizeof(*buf));
+
+	if (buf == NULL) {
+		ret = PQOS_RETVAL_ERROR;
+		goto resctrl_alloc_schemata_read_exit;
+	}
 
 	ASSERT(schemata != NULL);
 
 	fd = resctrl_alloc_fopen(class_id, rctl_schemata, "r");
-	if (fd == NULL)
-		return PQOS_RETVAL_ERROR;
+	if (fd == NULL) {
+		ret = PQOS_RETVAL_ERROR;
+		goto resctrl_alloc_schemata_read_exit;
+	}
 
 	if ((schemata->l3ca_num > 0 && schemata->l3ca == NULL)
 	    || (schemata->l2ca_num > 0 && schemata->l2ca == NULL)) {
@@ -564,8 +548,7 @@ resctrl_alloc_schemata_read(const unsigned class_id,
 		goto resctrl_alloc_schemata_read_exit;
 	}
 
-	memset(buf, 0, sizeof(buf));
-	while (fgets(buf, sizeof(buf), fd) != NULL) {
+	while (fgets(buf, buf_size, fd) != NULL) {
 		q = buf;
 		/**
 		 * Trim white spaces
@@ -626,12 +609,17 @@ resctrl_alloc_schemata_read(const unsigned class_id,
 		}
 	}
 
+
  resctrl_alloc_schemata_read_exit:
+
+	if (buf != NULL)
+		free(buf);
+
 	/* check if error occured */
-	if (ret != PQOS_RETVAL_OK)
-		resctrl_alloc_fclose(fd);
-	else
+	if (ret == PQOS_RETVAL_OK)
 		ret = resctrl_alloc_fclose(fd);
+	else if (fd)
+		resctrl_alloc_fclose(fd);
 
 	return ret;
 }
@@ -642,29 +630,57 @@ resctrl_alloc_schemata_write(const unsigned class_id,
 {
 	int ret = PQOS_RETVAL_OK;
 	unsigned i;
-	FILE *fd;
-	char buf[16 * 1024];
+	FILE *fd = NULL;
+	const size_t buf_size = 16 * 1024;
+	char *buf = calloc(buf_size, sizeof(*buf));
+
+	if (buf == NULL) {
+		ret = PQOS_RETVAL_ERROR;
+		goto resctrl_alloc_schemata_write_exit;
+	}
 
 	ASSERT(schemata != NULL);
 
 	fd = resctrl_alloc_fopen(class_id, rctl_schemata, "w");
-	if (fd == NULL)
-		return PQOS_RETVAL_ERROR;
+	if (fd == NULL) {
+		ret = PQOS_RETVAL_ERROR;
+		goto resctrl_alloc_schemata_write_exit;
+	}
 
 	/* Enable fully buffered output. File won't be flushed until 16kB
 	 * buffer is full */
-	if (setvbuf(fd, buf, _IOFBF, sizeof(buf)) != 0) {
-		resctrl_alloc_fclose(fd);
-		return PQOS_RETVAL_ERROR;
+	if (setvbuf(fd, buf, _IOFBF, buf_size) != 0) {
+		ret = PQOS_RETVAL_ERROR;
+		goto resctrl_alloc_schemata_write_exit;
 	}
 
-	/* L2 */
-	if (schemata->l2ca_num > 0) {
+	/* L2 without CDP */
+	if (schemata->l2ca_num > 0 && !schemata->l2ca[0].cdp) {
 		fprintf(fd, "L2:");
 		for (i = 0; i < schemata->l2ca_num; i++) {
 			if (i > 0)
 				fprintf(fd, ";");
-			fprintf(fd, "%u=%x", i, schemata->l2ca[i].ways_mask);
+			fprintf(fd, "%u=%llx", i, (unsigned long long)
+			        schemata->l2ca[i].u.ways_mask);
+		}
+		fprintf(fd, "\n");
+	}
+
+	/* L2 with CDP */
+	if (schemata->l2ca_num > 0 && schemata->l2ca[0].cdp) {
+		fprintf(fd, "L2CODE:");
+		for (i = 0; i < schemata->l2ca_num; i++) {
+			if (i > 0)
+				fprintf(fd, ";");
+			fprintf(fd, "%u=%llx", i, (unsigned long long)
+				schemata->l2ca[i].u.s.code_mask);
+		}
+		fprintf(fd, "\nL2DATA:");
+		for (i = 0; i < schemata->l2ca_num; i++) {
+			if (i > 0)
+				fprintf(fd, ";");
+			fprintf(fd, "%u=%llx", i, (unsigned long long)
+				schemata->l2ca[i].u.s.data_mask);
 		}
 		fprintf(fd, "\n");
 	}
@@ -711,7 +727,18 @@ resctrl_alloc_schemata_write(const unsigned class_id,
 		fprintf(fd, "\n");
 	}
 
-	ret = resctrl_alloc_fclose(fd);
+
+resctrl_alloc_schemata_write_exit:
+
+	/* check if error occured */
+	if (ret == PQOS_RETVAL_OK)
+		ret = resctrl_alloc_fclose(fd);
+	else if (fd)
+		resctrl_alloc_fclose(fd);
+
+	/* setvbuf buffer should be freed after fclose */
+	if (buf != NULL)
+		free(buf);
 
 	return ret;
 }
@@ -905,3 +932,61 @@ resctrl_alloc_task_file_check(const unsigned class_id, unsigned *found)
 	return PQOS_RETVAL_OK;
 }
 
+int
+resctrl_alloc_assoc_set(const unsigned lcore, const unsigned class_id)
+{
+	int ret;
+	struct resctrl_cpumask mask;
+
+	ret = resctrl_alloc_cpumask_read(class_id, &mask);
+	if (ret != PQOS_RETVAL_OK)
+		return ret;
+
+	resctrl_cpumask_set(lcore, &mask);
+
+	ret = resctrl_alloc_cpumask_write(class_id, &mask);
+
+	return ret;
+}
+
+int
+resctrl_alloc_assoc_get(const unsigned lcore, unsigned *class_id)
+{
+	int ret;
+	unsigned grps;
+	unsigned i;
+	struct resctrl_cpumask mask;
+
+	ASSERT(m_cap != NULL);
+
+	ret = resctrl_alloc_get_grps_num(m_cap, &grps);
+	if (ret != PQOS_RETVAL_OK)
+		return ret;
+
+	for (i = 0; i < grps; i++) {
+		ret = resctrl_alloc_cpumask_read(i, &mask);
+		if (ret != PQOS_RETVAL_OK)
+			return ret;
+
+		if (resctrl_cpumask_get(lcore, &mask)) {
+			*class_id = i;
+                        return PQOS_RETVAL_OK;
+		}
+	}
+
+	return ret;
+}
+
+int
+resctrl_alloc_assoc_set_pid(const pid_t task, const unsigned class_id)
+{
+	/* Write to tasks file */
+	return resctrl_alloc_task_write(class_id, task);
+}
+
+int
+resctrl_alloc_assoc_get_pid(const pid_t task, unsigned *class_id)
+{
+	/* Search tasks files */
+	return resctrl_alloc_task_search(class_id, m_cap, task);
+}

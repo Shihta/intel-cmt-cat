@@ -39,22 +39,32 @@
 #ifndef __PQOS_RESCTRL_ALLOC_H__
 #define __PQOS_RESCTRL_ALLOC_H__
 
-#include <limits.h>                     /**< CHAR_BIT*/
-
 #include "pqos.h"
+#include "resctrl.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#ifndef RESCTRL_ALLOC_PATH
-#define RESCTRL_ALLOC_PATH "/sys/fs/resctrl"
-#endif
+/**
+ * @brief Initializes resctrl allocation sub-module
+ *
+ * @param cpu cpu topology structure
+ * @param cap capabilities structure
+ *
+ * @return Operational status
+ * @retval PQOS_RETVAL_OK success
+ */
+int resctrl_alloc_init(const struct pqos_cpuinfo *cpu,
+	               const struct pqos_cap *cap);
 
 /**
- * Max supported number of CPU's
+ * @brief Shuts down resctrl allocation sub-module for OS allocation
+ *
+ * @return Operation status
+ * @retval PQOS_RETVAL_OK success
  */
-#define RESCTRL_ALLOC_MAX_CPUS 4096
+int resctrl_alloc_fini(void);
 
 /**
  * @brief Retrieves number of resctrl groups allowed
@@ -68,42 +78,6 @@ extern "C" {
 int resctrl_alloc_get_grps_num(const struct pqos_cap *cap, unsigned *grps_num);
 
 /**
- * @brief Structure to hold parsed cpu mask
- *
- * Structure contains table with cpu bit mask. Each table item holds
- * information about 8 bit in mask.
- *
- * Example bitmask tables:
- *  - cpus file contains 'ABC' mask = [ ..., 0x0A, 0xBC ]
- *  - cpus file contains 'ABCD' mask = [ ..., 0xAB, 0xCD ]
- */
-struct resctrl_alloc_cpumask {
-	uint8_t tab[RESCTRL_ALLOC_MAX_CPUS / CHAR_BIT];  /**< bit mask table */
-};
-
-/**
- * @brief Set lcore bit in cpu mask
- *
- * @param [in] lcore Core number
- * @param [in] cpumask Modified cpu mask
- */
-void resctrl_alloc_cpumask_set(const unsigned lcore,
-                               struct resctrl_alloc_cpumask *mask);
-
-/**
- * @brief Check if lcore is set in cpu mask
- *
- * @param [in] lcore Core number
- * @param [in] cpumask Cpu mask
- *
- * @return Returns 1 when bit corresponding to lcore is set in mask
- * @retval 1 if cpu bit is set in mask
- * @retval 0 if cpu bit is not set in mask
- */
-int resctrl_alloc_cpumask_get(const unsigned lcore,
-	                      const struct resctrl_alloc_cpumask *mask);
-
-/**
  * @brief Write CPU mask to file
  *
  * @param [in] class_id COS id
@@ -113,7 +87,7 @@ int resctrl_alloc_cpumask_get(const unsigned lcore,
  * @retval PQOS_RETVAL_OK on success
  */
 int resctrl_alloc_cpumask_write(const unsigned class_id,
-                                const struct resctrl_alloc_cpumask *mask);
+                                const struct resctrl_cpumask *mask);
 
 /**
  * @brief Read CPU mask from file
@@ -125,7 +99,7 @@ int resctrl_alloc_cpumask_write(const unsigned class_id,
  * @retval PQOS_RETVAL_OK on success
  */
 int resctrl_alloc_cpumask_read(const unsigned class_id,
-	                       struct resctrl_alloc_cpumask *mask);
+	                       struct resctrl_cpumask *mask);
 
 /*
  * @brief Structure to hold parsed schemata
@@ -246,6 +220,54 @@ int resctrl_alloc_task_search(unsigned *class_id,
  * @return Operation status
  */
 int resctrl_alloc_task_file_check(const unsigned class_id, unsigned *found);
+
+
+/**
+ * @brief Resctrl interface to associate \a lcore
+ *        with given class of service
+ *
+ * @param [in] lcore CPU logical core id
+ * @param [in] class_id class of service
+ *
+ * @return Operations status
+ */
+int resctrl_alloc_assoc_set(const unsigned lcore, const unsigned class_id);
+
+/**
+ * @brief Resctrl interface to read association
+ *        of \a lcore with class of service
+ *
+ * @param [in] lcore CPU logical core id
+ * @param [out] class_id class of service
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int resctrl_alloc_assoc_get(const unsigned lcore, unsigned *class_id);
+
+/**
+ * @brief Resctrl interface to associate \a task
+ *        with given class of service
+ *
+ * @param [in] task task id to be associated
+ * @param [in] class_id class of service
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int resctrl_alloc_assoc_set_pid(const pid_t task, const unsigned class_id);
+
+/**
+ * @brief Resctrl interface to read association
+ *        of \a task with class of service
+ *
+ * @param [in] task task id to find association
+ * @param [out] class_id class of service
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+int resctrl_alloc_assoc_get_pid(const pid_t task, unsigned *class_id);
 
 #ifdef __cplusplus
 }

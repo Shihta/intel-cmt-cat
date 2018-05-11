@@ -1,7 +1,7 @@
 /*
  * BSD LICENSE
  *
- * Copyright(c) 2014-2017 Intel Corporation. All rights reserved.
+ * Copyright(c) 2014-2018 Intel Corporation. All rights reserved.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -71,7 +71,9 @@
 #include "log.h"
 #include "api.h"
 #include "utils.h"
+#include "resctrl.h"
 #include "resctrl_alloc.h"
+#include "perf_monitoring.h"
 
 /**
  * ---------------------------------------
@@ -89,8 +91,8 @@
 
 #define PQOS_CPUID_CAT_CDP_BIT       2       /**< CDP supported bit */
 
-#define PQOS_MSR_L3_QOS_CFG          0xC81   /**< CAT config register */
-#define PQOS_MSR_L3_QOS_CFG_CDP_EN   1ULL    /**< CDP enable bit */
+#define PQOS_MSR_L3_QOS_CFG          0xC81   /**< L3 CAT config register */
+#define PQOS_MSR_L3_QOS_CFG_CDP_EN   1ULL    /**< L3 CDP enable bit */
 
 #define PQOS_MSR_L3CA_MASK_START     0xC90   /**< L3 CAT class 0 register */
 #define PQOS_MSR_L3CA_MASK_END       0xD0F   /**< L3 CAT class 127 register */
@@ -98,6 +100,9 @@
                                                 register */
 #define PQOS_MSR_ASSOC_QECOS_SHIFT   32
 #define PQOS_MSR_ASSOC_QECOS_MASK    0xffffffff00000000ULL
+
+#define PQOS_MSR_L2_QOS_CFG          0xC82   /**< L2 CAT config register */
+#define PQOS_MSR_L2_QOS_CFG_CDP_EN   1ULL    /**< L2 CDP enable bit */
 
 #define PQOS_MSR_L2CA_MASK_START     0xC10   /**< L2 CAT class 0 register */
 #define PQOS_MSR_L2CA_MASK_END       0xD8F   /**< L2 CAT class 127 register */
@@ -110,6 +115,8 @@
 #define LOCKFILE "/var/tmp/libpqos.lockfile"
 #endif
 #endif /*!LOCKFILE*/
+
+#define PROC_CPUINFO "/proc/cpuinfo"
 
 /**
  * ---------------------------------------
@@ -151,6 +158,7 @@ static pthread_mutex_t m_apilock_mutex;
  * Interface status
  *   0  PQOS_INTER_MSR
  *   1  PQOS_INTER_OS
+ *   2  PQOS_INTER_OS_RESCTRL_MON
  */
 #ifdef __linux__
 static int m_interface = PQOS_INTER_MSR;
@@ -340,7 +348,7 @@ add_monitoring_event(struct pqos_cap_mon *mon,
         mon->events[mon->num_events].type = (enum pqos_mon_event) event_type;
         mon->events[mon->num_events].max_rmid = max_rmid;
         mon->events[mon->num_events].scale_factor = scale_factor;
-        mon->events[mon->num_events].os_support = 0;
+        mon->events[mon->num_events].os_support = PQOS_OS_MON_UNSUPPORTED;
         mon->num_events++;
 }
 
@@ -479,21 +487,21 @@ discover_monitoring(struct pqos_cap_mon **r_mon,
 }
 
 /**
- * @brief Checks CDP enable status across all CPU sockets
+ * @brief Checks L3 CDP enable status across all CPU sockets
  *
- * It also validates if CDP enabling is consistent across
+ * It also validates if L3 CDP enabling is consistent across
  * CPU sockets.
  * At the moment, such scenario is considered as error
  * that requires CAT reset.
  *
  * @param cpu detected CPU topology
- * @param enabled place to store CDP enabling status
+ * @param enabled place to store L3 CDP enabling status
  *
  * @return Operations status
  * @retval PQOS_RETVAL_OK on success
  */
 static int
-cdp_is_enabled(const struct pqos_cpuinfo *cpu,
+l3cdp_is_enabled(const struct pqos_cpuinfo *cpu,
                int *enabled)
 {
         unsigned *sockets = NULL;
@@ -520,13 +528,13 @@ cdp_is_enabled(const struct pqos_cpuinfo *cpu,
 
                 ret = pqos_cpu_get_one_core(cpu, sockets[j], &core);
                 if (ret != PQOS_RETVAL_OK)
-			goto cdp_is_enabled_exit;
+                        goto l3cdp_is_enabled_exit;
 
                 if (msr_read(core, PQOS_MSR_L3_QOS_CFG, &reg) !=
                     MACHINE_RETVAL_OK) {
-			ret = PQOS_RETVAL_ERROR;
-			goto cdp_is_enabled_exit;
-		}
+                        ret = PQOS_RETVAL_ERROR;
+                        goto l3cdp_is_enabled_exit;
+                }
 
                 if (reg & PQOS_MSR_L3_QOS_CFG_CDP_EN)
                         enabled_num++;
@@ -535,20 +543,92 @@ cdp_is_enabled(const struct pqos_cpuinfo *cpu,
         }
 
         if (disabled_num > 0 && enabled_num > 0) {
-                LOG_ERROR("Inconsistent CDP settings across sockets."
+                LOG_ERROR("Inconsistent L3 CDP settings across sockets."
                           "Please reset CAT or reboot your system!\n");
                 ret = PQOS_RETVAL_ERROR;
-		goto cdp_is_enabled_exit;
+                goto l3cdp_is_enabled_exit;
         }
 
         if (enabled_num > 0)
                 *enabled = 1;
 
-        LOG_INFO("CDP is %s\n",
-                 (*enabled) ? "enabled" : "disabled");
+        LOG_INFO("L3 CDP is %s\n", (*enabled) ? "enabled" : "disabled");
 
- cdp_is_enabled_exit:
-	free(sockets);
+ l3cdp_is_enabled_exit:
+        if (sockets != NULL)
+                free(sockets);
+
+        return ret;
+}
+
+/**
+ * @brief Checks L2 CDP enable status across all CPU clusters
+ *
+ * It also validates if L2 CDP enabling is consistent across
+ * CPU clusters.
+ * At the moment, such scenario is considered as error
+ * that requires CAT reset.
+ *
+ * @param cpu detected CPU topology
+ * @param enabled place to store L2 CDP enabling status
+ *
+ * @return Operations status
+ * @retval PQOS_RETVAL_OK on success
+ */
+static int
+l2cdp_is_enabled(const struct pqos_cpuinfo *cpu, int *enabled)
+{
+        unsigned *l2ids = NULL;
+        unsigned l2id_num = 0;
+        unsigned enabled_num = 0, disabled_num = 0;
+        unsigned i;
+        int ret = PQOS_RETVAL_OK;
+
+        /**
+         * Get list of L2 clusters id's
+         */
+        l2ids = pqos_cpu_get_l2ids(cpu, &l2id_num);
+        if (l2ids == NULL || l2id_num == 0) {
+                ret = PQOS_RETVAL_RESOURCE;
+                goto l2cdp_is_enabled_exit;
+        }
+
+        for (i = 0; i < l2id_num; i++) {
+                uint64_t reg = 0;
+                unsigned core = 0;
+
+                ret = pqos_cpu_get_one_by_l2id(cpu, l2ids[i], &core);
+                if (ret != PQOS_RETVAL_OK)
+                        goto l2cdp_is_enabled_exit;
+
+                if (msr_read(core, PQOS_MSR_L2_QOS_CFG, &reg) !=
+                    MACHINE_RETVAL_OK) {
+                        ret = PQOS_RETVAL_ERROR;
+                        goto l2cdp_is_enabled_exit;
+                }
+
+                if (reg & PQOS_MSR_L2_QOS_CFG_CDP_EN)
+                        enabled_num++;
+                else
+                        disabled_num++;
+        }
+
+        if (disabled_num > 0 && enabled_num > 0) {
+                LOG_ERROR("Inconsistent L2 CDP settings across clusters."
+                          "Please reset CAT or reboot your system!\n");
+                ret = PQOS_RETVAL_ERROR;
+                goto l2cdp_is_enabled_exit;
+        }
+
+        if (enabled_num > 0)
+                *enabled = 1;
+
+        LOG_INFO("L2 CDP is %s\n", (*enabled) ? "enabled" : "disabled");
+
+ l2cdp_is_enabled_exit:
+        if (l2ids != NULL)
+                free(l2ids);
+
         return ret;
 }
 
@@ -634,8 +714,9 @@ discover_alloc_l3_brandstr(struct pqos_cap_l3ca *cap)
         struct cpuid_out res;
         int ret = PQOS_RETVAL_OK,
                 match_found = 0;
-        char brand_str[MAX_BRAND_STRING_LEN+1];
-        uint32_t *brand_u32 = (uint32_t *)brand_str;
+        uint32_t brand[MAX_BRAND_STRING_LEN / 4 + 1];
+        char *brand_str = (char *)brand;
+        uint32_t *brand_u32 = brand;
         unsigned i = 0;
 
         /**
@@ -651,7 +732,7 @@ discover_alloc_l3_brandstr(struct pqos_cap_l3ca *cap)
                 return PQOS_RETVAL_ERROR;
         }
 
-        memset(brand_str, 0, sizeof(brand_str));
+        memset(brand, 0, sizeof(brand));
 
         for (i = 0; i < CPUID_LEAF_BRAND_NUM; i++) {
                 lcpuid((unsigned)CPUID_LEAF_BRAND_START + i, 0, &res);
@@ -725,6 +806,7 @@ discover_alloc_l3_cpuid(struct pqos_cap_l3ca *cap,
         cap->num_ways = res.eax + 1;
         cap->cdp = (res.ecx >> PQOS_CPUID_CAT_CDP_BIT) & 1;
         cap->cdp_on = 0;
+	cap->os_cdp = 0;
         cap->way_contention = (uint64_t) res.ebx;
 
         if (cap->cdp) {
@@ -733,9 +815,9 @@ discover_alloc_l3_cpuid(struct pqos_cap_l3ca *cap,
                  */
                 int cdp_on = 0;
 
-                ret = cdp_is_enabled(cpu, &cdp_on);
+                ret = l3cdp_is_enabled(cpu, &cdp_on);
                 if (ret != PQOS_RETVAL_OK) {
-                        LOG_ERROR("CDP detection error!\n");
+                        LOG_ERROR("L3 CDP detection error!\n");
                         return ret;
                 }
                 cap->cdp_on = cdp_on;
@@ -885,7 +967,27 @@ discover_alloc_l2(struct pqos_cap_l2ca **r_cap,
 
 	cap->num_classes = res.edx+1;
 	cap->num_ways = res.eax+1;
+        cap->cdp = (res.ecx >> PQOS_CPUID_CAT_CDP_BIT) & 1;
+        cap->cdp_on = 0;
+	cap->os_cdp = 0;
 	cap->way_contention = (uint64_t) res.ebx;
+
+        if (cap->cdp) {
+                int cdp_on = 0;
+
+                /*
+                 * Check if L2 CDP is enabled
+                 */
+                ret = l2cdp_is_enabled(cpu, &cdp_on);
+                if (ret != PQOS_RETVAL_OK) {
+                        LOG_ERROR("L2 CDP detection error!\n");
+                        free(cap);
+                        return ret;
+                }
+                cap->cdp_on = cdp_on;
+                if (cdp_on)
+                        cap->num_classes = cap->num_classes / 2;
+        }
 
 	ret = get_cache_info(&cpu->l2, NULL, &l2_size);
 	if (ret != PQOS_RETVAL_OK) {
@@ -896,9 +998,10 @@ discover_alloc_l2(struct pqos_cap_l2ca **r_cap,
 	if (cap->num_ways > 0)
 		cap->way_size = l2_size / cap->num_ways;
 
-	LOG_INFO("L2 CAT details: "
+	LOG_INFO("L2 CAT details: CDP support=%d, CDP on=%d, "
 		 "#COS=%u, #ways=%u, ways contention bit-mask 0x%x\n",
-		 cap->num_classes, cap->num_ways, cap->way_contention);
+		 cap->cdp, cap->cdp_on, cap->num_classes, cap->num_ways,
+                 cap->way_contention);
 	LOG_INFO("L2 CAT details: cache size %u bytes, way size %u bytes\n",
 		 l2_size, cap->way_size);
 
@@ -1137,6 +1240,7 @@ discover_capabilities(struct pqos_cap **p_cap,
         return ret;
 }
 
+#ifdef __linux__
 /**
  * @brief Checks file fname to detect str and set a flag
  *
@@ -1147,7 +1251,6 @@ discover_capabilities(struct pqos_cap **p_cap,
  * @return Operation status
  * @retval PQOS_RETVAL_OK success
  */
-#ifdef __linux__
 static int
 detect_os_support(const char *fname, const char *str, int *supported)
 {
@@ -1177,6 +1280,70 @@ detect_os_support(const char *fname, const char *str, int *supported)
 }
 
 /**
+ * @brief Check if event is supported by resctrl monitoring
+ *
+ * @param [in] event monitoring event type
+ * @param [out] supported set to 1 if resctrl support is present
+ *
+ * @return Operation status
+ * @retval PQOS_RETVAL_OK success
+ */
+static int
+detect_resctrl_support(const enum pqos_mon_event event, int *supported) {
+        char buf[128];
+        struct stat st;
+        const char *event_name = NULL;
+
+        ASSERT(supported != NULL);
+
+        *supported = 0;
+
+        switch (event) {
+        case PQOS_MON_EVENT_L3_OCCUP:
+                event_name = "llc_occupancy";
+                break;
+        case PQOS_MON_EVENT_LMEM_BW:
+                event_name = "mbm_total_bytes";
+                break;
+        case PQOS_MON_EVENT_TMEM_BW:
+                event_name = "mbm_local_bytes";
+                break;
+        default:
+                return PQOS_RETVAL_OK;
+                break;
+        }
+
+        /** Check if resctrl is mounted */
+        memset(buf, 0, sizeof(buf));
+        if (snprintf(buf, sizeof(buf) - 1, "%s/info", RESCTRL_PATH) < 0)
+                return PQOS_RETVAL_ERROR;
+
+        /**
+         * If resctrl is not mounted perform negative check for perf support
+         */
+        if (stat(buf, &st) != 0) {
+                /* perf is not present, assume that resctrl is supported*/
+                if (stat(PERF_MON_PATH, &st) != 0)
+                        *supported = 1;
+                return PQOS_RETVAL_OK;
+        }
+
+        /**
+         * Resctrl is mounted check if L3 monitoring is supported in resctrl
+         * info dir
+         */
+        memset(buf, 0, sizeof(buf));
+        if (snprintf(buf, sizeof(buf) - 1, "%s/info/L3_MON/mon_features",
+                RESCTRL_PATH) < 0)
+                return PQOS_RETVAL_ERROR;
+
+        if (stat(buf, &st) == 0)
+                return detect_os_support(buf, event_name, supported);
+
+        return PQOS_RETVAL_OK;
+}
+
+/**
  * @brief Get event name string to search in cpuinfo
  *
  * @param [in] event monitoring event type to look for
@@ -1199,6 +1366,28 @@ get_os_event_name(int event)
 }
 
 /**
+ * @brief Get event disable flag to seartch in kernel cmdline
+ *
+ * @param [in] event monitoring event type to look for
+ *
+ * @return cmdline flag
+ */
+static const char *
+get_os_event_disabled(int event)
+{
+        switch (event) {
+        case PQOS_MON_EVENT_L3_OCCUP:
+                return "!cmt";
+        case PQOS_MON_EVENT_LMEM_BW:
+                return "!mbmlocal";
+        case PQOS_MON_EVENT_TMEM_BW:
+                return "!mbmtotal";
+        default:
+                return NULL;
+        }
+}
+
+/**
  * @brief Runs detection of OS monitoring events
  *
  * @param mon Monitoring capability structure
@@ -1207,23 +1396,30 @@ get_os_event_name(int event)
  * @retval PQOS_RETVAL_OK success
  */
 static int
-discover_os_monitoring(struct pqos_cap_mon *mon) {
+discover_os_monitoring(struct pqos_cap_mon *mon,
+                       enum pqos_interface interface)
+{
 	int ret = PQOS_RETVAL_OK;
 	unsigned i;
-	int lmem_support = 0, tmem_support = 0;
+        enum pqos_os_mon lmem_support = PQOS_OS_MON_UNSUPPORTED;
+	enum pqos_os_mon tmem_support = PQOS_OS_MON_UNSUPPORTED;
+        int resctrl_support = 0;
 
-	ASSERT(mon != NULL);
+        ASSERT(mon != NULL);
 
-	for (i = 0; i < mon->num_events; i++) {
-		struct pqos_monitor *event = &(mon->events[i]);
-		const char *str = NULL;
+        for (i = 0; i < mon->num_events; i++) {
+                struct pqos_monitor *event = &(mon->events[i]);
+                const char *str = NULL;
+                int os_support;
+                int os_disabled = 0;
+                int os_resctrl;
 
 		/**
 		 * Assume support of perf events
 		 */
 		if (event->type == PQOS_PERF_EVENT_LLC_MISS ||
 		    event->type == PQOS_PERF_EVENT_IPC) {
-			event->os_support = 1;
+			event->os_support = PQOS_OS_MON_PERF;
 			continue;
 		}
 
@@ -1231,35 +1427,83 @@ discover_os_monitoring(struct pqos_cap_mon *mon) {
 		if (str == NULL)
 			continue;
 
-		ret = detect_os_support("/proc/cpuinfo", str,
-		                        &(event->os_support));
+                /**
+                 * Check if event is supported by kernel
+                 */
+		ret = detect_os_support(PROC_CPUINFO, str, &os_support);
 		if (ret != PQOS_RETVAL_OK) {
-			LOG_ERROR("Fatal error encountered in OS monitoring"
-			          " event detection!\n");
-			return ret;
-		}
+                        LOG_ERROR("Fatal error encountered in OS monitoring"
+                                  " event detection!\n");
+                        return ret;
+                }
 
-		if (event->os_support) {
-			if (event->type == PQOS_MON_EVENT_TMEM_BW)
-				tmem_support = 1;
-			if (event->type == PQOS_MON_EVENT_LMEM_BW)
-				lmem_support = 1;
-		}
+                /** Event not supported - continue*/
+                if (!os_support) {
+                        event->os_support = PQOS_OS_MON_UNSUPPORTED;
+                        continue;
+                }
+
+                /**
+                 * Check if feature is not disabled
+                 */
+                str = get_os_event_disabled(event->type);
+                if (str != NULL) {
+                        ret = detect_os_support("/proc/cmdline", str,
+                                &os_disabled);
+                        if (ret != PQOS_RETVAL_OK) {
+                                LOG_ERROR("Fatal error encountered while "
+                                          "checking for disabled events\n");
+                                return ret;
+                        }
+                }
+
+                /** Event disabled - continue */
+                if (os_disabled) {
+                        event->os_support = PQOS_OS_MON_UNSUPPORTED;
+                        continue;
+                }
+
+                /**
+                 * Check for resctrl support
+                 */
+                ret = detect_resctrl_support(event->type, &os_resctrl);
+                if (ret != PQOS_RETVAL_OK) {
+                        LOG_ERROR("Fatal error encountered while checking for "
+                                  "resctrl monitoring support\n");
+                        return ret;
+                }
+
+                if (os_resctrl) {
+                        event->os_support = PQOS_OS_MON_RESCTRL;
+                        resctrl_support = 1;
+                } else
+                        event->os_support = PQOS_OS_MON_PERF;
+
+		if (event->type == PQOS_MON_EVENT_TMEM_BW)
+			tmem_support = event->os_support;
+		if (event->type == PQOS_MON_EVENT_LMEM_BW)
+			lmem_support = event->os_support;
 	}
 
 	/**
-	* RMEM is supported when both LMEM and TMEM are
-	* supported
+	* RMEM is supported when both LMEM and TMEM are supported
 	*/
 	for (i = 0; i < mon->num_events; i++) {
 		struct pqos_monitor *event = &(mon->events[i]);
 
 		if (event->type == PQOS_MON_EVENT_RMEM_BW) {
-			event->os_support = lmem_support &&
-			                    tmem_support;
+			if (lmem_support == tmem_support)
+				event->os_support = lmem_support;
+			else
+				event->os_support = PQOS_OS_MON_UNSUPPORTED;
 			break;
 		}
 	}
+
+        if (interface == PQOS_INTER_OS_RESCTRL_MON && !resctrl_support) {
+                LOG_ERROR("Resctrl monitoring selected but not supported\n");
+                return PQOS_RETVAL_INTER;
+        }
 
 	return ret;
 }
@@ -1274,7 +1518,7 @@ discover_os_monitoring(struct pqos_cap_mon *mon) {
  * @retval PQOS_RETVAL_OK success
  */
 static int
-discover_os_capabilities(struct pqos_cap *p_cap, int interface)
+discover_os_capabilities(struct pqos_cap *p_cap, enum pqos_interface interface)
 {
         int ret = PQOS_RETVAL_OK;
         int res_flag = 0;
@@ -1287,10 +1531,10 @@ discover_os_capabilities(struct pqos_cap *p_cap, int interface)
                 const char *str;
                 const char *desc;
         } tab[PQOS_CAP_TYPE_NUMOF] = {
-                { "/proc/cpuinfo", "cqm", "CMT"},
-                { "/proc/cpuinfo", "cat_l3", "L3 CAT"},
-                { "/proc/cpuinfo", "cat_l2", "L2 CAT"},
-                { "/proc/cpuinfo", "mba", "MBA"},
+                { PROC_CPUINFO, "cqm", "CMT"},
+                { PROC_CPUINFO, "cat_l3", "L3 CAT"},
+                { PROC_CPUINFO, "cat_l2", "L2 CAT"},
+                { PROC_CPUINFO, "mba", "MBA"},
         };
 
         /**
@@ -1306,8 +1550,11 @@ discover_os_capabilities(struct pqos_cap *p_cap, int interface)
                  "resctrl not detected. "
                  "Kernel version 4.10 or higher required");
 
-        if (interface == PQOS_INTER_OS && res_flag == 0) {
+        if ((interface == PQOS_INTER_OS ||
+                interface == PQOS_INTER_OS_RESCTRL_MON) && res_flag == 0) {
                 LOG_ERROR("OS interface selected but not supported\n");
+                if (interface == PQOS_INTER_OS_RESCTRL_MON)
+                        return PQOS_RETVAL_INTER;
                 return PQOS_RETVAL_ERROR;
         }
         /**
@@ -1316,6 +1563,9 @@ discover_os_capabilities(struct pqos_cap *p_cap, int interface)
         for (i = 0; i < p_cap->num_cap; i++) {
                 struct pqos_capability *capability = &(p_cap->capabilities[i]);
                 int type = capability->type;
+
+                ASSERT(type < PQOS_CAP_TYPE_NUMOF);
+
                 int *os_ptr = &(capability->os_support);
 
                 ret = detect_os_support(tab[type].fname, tab[type].str, os_ptr);
@@ -1329,7 +1579,8 @@ discover_os_capabilities(struct pqos_cap *p_cap, int interface)
 		 * Discover available monitoring events
 		 */
 		if (type == PQOS_CAP_TYPE_MON && res_flag) {
-			ret = discover_os_monitoring(capability->u.mon);
+			ret = discover_os_monitoring(capability->u.mon,
+                                                     interface);
 			if (ret != PQOS_RETVAL_OK)
 				return ret;
 		}
@@ -1341,13 +1592,39 @@ discover_os_capabilities(struct pqos_cap *p_cap, int interface)
                 if (type == PQOS_CAP_TYPE_L3CA && *os_ptr == 0 && res_flag)
                         *os_ptr = 1;
 
+		/**
+		 * Discover L3 CDP support
+		 */
+		if (type == PQOS_CAP_TYPE_L3CA && *os_ptr) {
+			ret = detect_os_support(PROC_CPUINFO, "cdp_l3",
+			                        &capability->u.l3ca->os_cdp);
+			if (ret != PQOS_RETVAL_OK) {
+				LOG_ERROR("Fatal error encountered in L3 CDP "
+				          "detection!\n");
+				return ret;
+			}
+		}
+
+                /**
+                 * Discover L2 CDP support
+                 */
+                if (type == PQOS_CAP_TYPE_L2CA && *os_ptr) {
+                        ret = detect_os_support(PROC_CPUINFO, "cdp_l2",
+                                                &capability->u.l2ca->os_cdp);
+                        if (ret != PQOS_RETVAL_OK) {
+                                LOG_ERROR("Fatal error encountered in L2 CDP "
+                                          "detection!\n");
+                                return ret;
+                        }
+                }
+
                 LOG_INFO("OS support for %s %s\n", tab[type].desc, *os_ptr ?
                          "detected" : "not detected");
         }
         /**
          * Check if resctrl is mounted
          */
-        if (access(RESCTRL_ALLOC_PATH"/cpus", F_OK) != 0) {
+        if (access(RESCTRL_PATH"/cpus", F_OK) != 0) {
                 LOG_INFO("resctrl not mounted\n");
                 return PQOS_RETVAL_RESOURCE;
         } else if (interface == PQOS_INTER_MSR)
@@ -1496,13 +1773,31 @@ pqos_init(const struct pqos_config *config)
         ASSERT(m_cap != NULL);
 #ifdef __linux__
         ret = discover_os_capabilities(m_cap, config->interface);
-        if (ret == PQOS_RETVAL_ERROR) {
+        if (ret == PQOS_RETVAL_ERROR || ret == PQOS_RETVAL_INTER) {
                 LOG_ERROR("discover_os_capabilities() error %d\n", ret);
                 goto machine_init_error;
         }
 #endif
 
-        if (config->interface == PQOS_INTER_OS) {
+        if (config->interface == PQOS_INTER_OS ||
+                config->interface == PQOS_INTER_OS_RESCTRL_MON) {
+                const struct pqos_capability *l2_cap = NULL;
+
+                ret = pqos_cap_get_type(m_cap, PQOS_CAP_TYPE_L2CA, &l2_cap);
+                if (ret != PQOS_RETVAL_OK && ret != PQOS_RETVAL_RESOURCE)
+                        goto machine_init_error;
+
+                /* L2 CDP enabled but not supported by OS interface */
+                if (l2_cap != NULL && l2_cap->u.l2ca->cdp &&
+                        !l2_cap->u.l2ca->os_cdp) {
+                        LOG_ERROR("Detected L2 CDP feature enabled but not "
+                                  "supported by the current OS version!\n"
+                                  "Please disable L2 CDP through the HW "
+                                  "interface and perform a CAT reset.\n");
+                        ret = PQOS_RETVAL_ERROR;
+                        goto machine_init_error;
+                }
+
 #ifdef __linux__
                 ret = log_hw_caps(m_cap);
 #else
@@ -1524,32 +1819,12 @@ pqos_init(const struct pqos_config *config)
 
         ret = api_init(config->interface);
         if (ret != PQOS_RETVAL_OK) {
-                LOG_ERROR("api_init() error %d\n", ret);
+                LOG_ERROR("_pqos_api_init() error %d\n", ret);
                 goto machine_init_error;
         }
 #ifdef __linux__
         m_interface = config->interface;
 #endif
-        /**
-         * If monitoring capability has been discovered
-         * then get max RMID supported by a CPU socket
-         * and allocate memory for RMID table
-         */
-        ret = pqos_mon_init(m_cpu, m_cap, config);
-        switch (ret) {
-        case PQOS_RETVAL_RESOURCE:
-                LOG_DEBUG("monitoring init aborted: feature not present\n");
-                break;
-        case PQOS_RETVAL_OK:
-                LOG_DEBUG("monitoring init OK\n");
-                mon_init = 1;
-                break;
-        case PQOS_RETVAL_ERROR:
-        default:
-                LOG_ERROR("monitoring init error %d\n", ret);
-                break;
-        }
-
         ret = pqos_alloc_init(m_cpu, m_cap, config);
         switch (ret) {
         case PQOS_RETVAL_BUSY:
@@ -1561,6 +1836,27 @@ pqos_init(const struct pqos_config *config)
                 break;
         default:
                 LOG_ERROR("allocation init error %d\n", ret);
+                break;
+        }
+
+        /**
+         * If monitoring capability has been discovered
+         * then get max RMID supported by a CPU socket
+         * and allocate memory for RMID table
+         */
+        ret = pqos_mon_init(m_cpu, m_cap, config);
+        switch (ret) {
+        case PQOS_RETVAL_RESOURCE:
+                LOG_DEBUG("monitoring init aborted: feature not present\n");
+                ret = PQOS_RETVAL_OK;
+                break;
+        case PQOS_RETVAL_OK:
+                LOG_DEBUG("monitoring init OK\n");
+                mon_init = 1;
+                break;
+        case PQOS_RETVAL_ERROR:
+        default:
+                LOG_ERROR("monitoring init error %d\n", ret);
                 break;
         }
 
@@ -1581,8 +1877,11 @@ pqos_init(const struct pqos_config *config)
                 (void) log_fini();
  init_error:
         if (ret != PQOS_RETVAL_OK) {
-                if (m_cap != NULL)
+                if (m_cap != NULL) {
+                        for (i = 0; i < m_cap->num_cap; i++)
+                                free(m_cap->capabilities[i].u.generic_ptr);
                         free(m_cap);
+                }
                 m_cpu = NULL;
                 m_cap = NULL;
         }
@@ -1692,12 +1991,14 @@ pqos_cap_get(const struct pqos_cap **cap,
 }
 
 void
-_pqos_cap_l3cdp_change(const int prev, const int next)
+_pqos_cap_l3cdp_change(const enum pqos_cdp_config cdp)
 {
         struct pqos_cap_l3ca *l3_cap = NULL;
         unsigned i;
 
+        ASSERT(cdp == PQOS_REQUIRE_CDP_ON || cdp == PQOS_REQUIRE_CDP_OFF);
         ASSERT(m_cap != NULL);
+
         if (m_cap == NULL)
                 return;
 
@@ -1708,15 +2009,47 @@ _pqos_cap_l3cdp_change(const int prev, const int next)
         if (l3_cap == NULL)
                 return;
 
-        if (!prev && next) {
+        if (cdp == PQOS_REQUIRE_CDP_ON && !l3_cap->cdp_on) {
                 /* turn on */
                 l3_cap->cdp_on = 1;
                 l3_cap->num_classes = l3_cap->num_classes / 2;
         }
 
-        if (prev && !next) {
+        if (cdp == PQOS_REQUIRE_CDP_OFF && l3_cap->cdp_on) {
                 /* turn off */
                 l3_cap->cdp_on = 0;
                 l3_cap->num_classes = l3_cap->num_classes * 2;
+        }
+}
+
+void
+_pqos_cap_l2cdp_change(const enum pqos_cdp_config cdp)
+{
+        struct pqos_cap_l2ca *l2_cap = NULL;
+        unsigned i;
+
+        ASSERT(cdp == PQOS_REQUIRE_CDP_ON || cdp == PQOS_REQUIRE_CDP_OFF);
+        ASSERT(m_cap != NULL);
+
+        if (m_cap == NULL)
+                return;
+
+        for (i = 0; i < m_cap->num_cap && l2_cap == NULL; i++)
+                if (m_cap->capabilities[i].type == PQOS_CAP_TYPE_L2CA)
+                        l2_cap = m_cap->capabilities[i].u.l2ca;
+
+        if (l2_cap == NULL)
+                return;
+
+        if (cdp == PQOS_REQUIRE_CDP_ON && !l2_cap->cdp_on) {
+                /* turn on */
+                l2_cap->cdp_on = 1;
+                l2_cap->num_classes = l2_cap->num_classes / 2;
+        }
+
+        if (cdp == PQOS_REQUIRE_CDP_OFF && l2_cap->cdp_on) {
+                /* turn off */
+                l2_cap->cdp_on = 0;
+                l2_cap->num_classes = l2_cap->num_classes * 2;
         }
 }
