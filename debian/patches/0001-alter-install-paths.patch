@@ -1,0 +1,83 @@
+Modify makefiles to install in correct paths
+
+Signed-off-by: Colin Ian King <colin.king@canonical.com>
+
+Index: intel-cmt-cat-1.1.0/lib/Makefile
+===================================================================
+--- intel-cmt-cat-1.1.0.orig/lib/Makefile
++++ intel-cmt-cat-1.1.0/lib/Makefile
+@@ -87,8 +87,8 @@ endif
+ 
+ HDR = pqos.h
+ PREFIX ?= /usr/local
+-LIB_INSTALL_DIR ?= $(PREFIX)/lib
+-HDR_DIR ?= $(PREFIX)/include
++LIB_INSTALL_DIR = $(DESTDIR)/usr/lib
++HDR_DIR ?= $(DESTDIR)/usr/include
+ DEPFILE = $(LIB).dep
+ 
+ all: $(LIBNAME)
+@@ -116,17 +116,15 @@ endif
+ 
+ # Create symlinks to DSO
+ ifeq ($(SHARED),y)
+-	cd $(LIB_INSTALL_DIR); \
+-		ln -f -s $(LIB).so.$(VERSION) $(LIB).so.$(SO_VERSION); \
+-		ln -f -s $(LIB).so.$(SO_VERSION) $(LIB).so
+-	ldconfig
++#	ln -f -s $(LIB_INSTALL_DIR)/$(LIB).so.0 $(LIBDIR)/$(LIB).so
++#	ln -f -s $(LIB_INSTALL_DIR)/$(LIBNAME) $(LIBDIR)/$(LIB).so.0
++	ln -f -s /usr/lib/$(LIB).so.$(SO_VERSION) $(LIB_INSTALL_DIR)/$(LIB).so
++	ln -f -s /usr/lib/$(LIBNAME) $(LIB_INSTALL_DIR)/$(LIB).so.$(SO_VERSION)
++#	ldconfig
+ endif
+ 
+ uninstall:
+ 	-rm $(LIB_INSTALL_DIR)/libpqos*
+-ifeq ($(SHARED),y)
+-	ldconfig
+-endif
+ 
+ DEPFILES = $(SRCS:.c=.d)
+ 
+Index: intel-cmt-cat-1.1.0/pqos/Makefile
+===================================================================
+--- intel-cmt-cat-1.1.0.orig/pqos/Makefile
++++ intel-cmt-cat-1.1.0/pqos/Makefile
+@@ -67,8 +67,8 @@ MAN = pqos.8
+ 
+ # XXX: modify as desired
+ PREFIX ?= /usr/local
+-BIN_DIR = $(PREFIX)/bin
+-MAN_DIR = $(PREFIX)/man/man8
++BIN_DIR = $(DESTDIR)/usr/sbin
++MAN_DIR = $(DESTDIR)/usr/share/man/man8
+ 
+ SRCS = $(sort $(wildcard *.c))
+ OBJS = $(SRCS:.c=.o)
+@@ -100,8 +100,8 @@ else
+ 	install -D $(APP)-msr $(BIN_DIR)/$(APP)-msr
+ 	install -D $(APP)-os $(BIN_DIR)/$(APP)-os
+ 	install -m 0444 $(MAN) -D $(MAN_DIR)/$(MAN)
+-	ln -f -s $(MAN) $(MAN_DIR)/$(APP)-msr.8
+-	ln -f -s $(MAN) $(MAN_DIR)/$(APP)-os.8
++	ln -f -s /usr/share/man/man8/$(MAN).gz $(MAN_DIR)/$(APP)-msr.8.gz
++	ln -f -s /usr/share/man/man8/$(MAN).gz $(MAN_DIR)/$(APP)-os.8.gz
+ endif
+ 
+ uninstall:
+Index: intel-cmt-cat-1.1.0/rdtset/Makefile
+===================================================================
+--- intel-cmt-cat-1.1.0.orig/rdtset/Makefile
++++ intel-cmt-cat-1.1.0/rdtset/Makefile
+@@ -73,8 +73,8 @@ MAN = rdtset.8
+ 
+ # XXX: modify as desired
+ PREFIX ?= /usr/local
+-BIN_DIR = $(PREFIX)/bin
+-MAN_DIR = $(PREFIX)/man/man8
++BIN_DIR = $(DESTDIR)/usr/sbin
++MAN_DIR = $(DESTDIR)/usr/share/man/man8
+ 
+ SRCS = $(sort $(wildcard *.c))
+ OBJS = $(SRCS:.c=.o)

@@ -1,0 +1,17 @@
+Source: intel-cmt-cat
+Section: admin
+Priority: optional
+Maintainer: Colin King <colin.king@canonical.com>
+Uploaders: Kamal Mostafa <kamal@whence.com>
+Standards-Version: 4.1.2
+Build-Depends: debhelper (>= 11), quilt
+Homepage: https://github.com/01org/intel-cmt-cat
+
+Package: intel-cmt-cat
+Architecture: i386 amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Intel cache monitoring and allocation technology config tool
+ intel-cmt-cat provides monitoring and configuration of Intel
+ Cache Monitoring Technology (CMT), Memory Bandwidth Monitoring (MBM) and
+ Cache Allocation Technology (CAT) features on modern Intel (R) Xeon (R)
+ processors: Xeon D, Xeon E5 v3, Xeon E3 v4, or later models.
